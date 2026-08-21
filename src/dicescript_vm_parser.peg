@@ -1,0 +1,424 @@
+# DiceScript full-language grammar for the C99 VM.
+# The rule ordering follows sealdice/dicescript roll.peg at the pinned
+# compatibility baseline.  Actions build a compact AST interpreted by
+# dicescript_vm.c; the generated parser contains no host-specific behavior.
+
+%prefix "dsfull"
+%value "ds_ast_t *"
+%auxil "ds_vm_parser_t *"
+
+%header {
+#include "dicescript_vm_internal.h"
+}
+
+%source {
+#define PCC_GETCHAR(auxil) ds_vm_input_getchar(auxil)
+#define PCC_ERROR(auxil) ds_vm_parser_error(auxil)
+}
+
+input <- sp "^st" sp body:st_items sp !. {
+    auxil->root = ds_vm_ast(auxil, DS_AST_ST_ROOT, body, NULL, NULL, $0s, $0e);
+    $$ = auxil->root;
+}
+      / sp body:statements sp !. {
+    auxil->root = ds_vm_ast(auxil, DS_AST_BLOCK, body, NULL, NULL, $0s, $0e);
+    $$ = auxil->root;
+}
+
+st_items <- h:st_item sp ','? sp t:st_items { $$ = ds_vm_chain(h, t); }
+          / h:st_item { $$ = h; }
+
+st_item <- '&' n:st_name sp (':' / '=') sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_SET_COMPUTED;
+             }
+           / n:st_name sp '*' sp x:st_value sp (':' / '=') sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, x, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_SET_X1;
+             }
+           / n:st_name sp '*' sp (':' / '=') sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_SET_X0;
+             }
+           / n:st_name sp "+=" sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_MOD_ADD;
+             }
+           / n:st_name sp "-=" sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_MOD_SUBTRACT_ASSIGN;
+             }
+           / n:st_name sp '+' sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_MOD_ADD;
+             }
+           / n:st_name sp '-' sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_MOD_SUBTRACT;
+             }
+           / n:st_name sp (':' / '=') sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_SET;
+             }
+           / n:st_name sp v:st_value {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_ITEM, n, v, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = DS_VM_ST_SET;
+             }
+
+# Upstream disables bitwise operators for an unparenthesized ^st value.  Apart
+# from matching its semantics, this keeps the '&' starting the next computed
+# attribute from being consumed by the previous value.
+st_value <- e:st_ternary { $$ = ds_vm_ast(auxil, DS_AST_ST_VALUE, e, NULL, NULL, $0s, $0e); }
+st_ternary <- c:st_logic_or sp '?' sp y:st_logic_or sp ':' sp n:st_logic_or {
+                  $$ = ds_vm_ast(auxil, DS_AST_TERNARY, c, y, n, $0s, $0e);
+              }
+            / h:st_ternary_case t:st_ternary_cases { $$ = ds_vm_chain(h, t); }
+            / e:st_logic_or { $$ = e; }
+st_ternary_case <- c:st_logic_or sp '?' sp y:st_logic_or sp {
+                       $$ = ds_vm_ast(auxil, DS_AST_TERNARY, c, y, NULL, $0s, $0e);
+                   }
+st_ternary_cases <- ',' sp h:st_ternary_case t:st_ternary_cases { $$ = ds_vm_chain(h, t); }
+                  / { $$ = NULL; }
+st_logic_or <- l:st_logic_or sp "||" sp r:st_logic_and {
+                   $$ = ds_vm_binary(auxil, DS_AST_LOGIC_OR, l, r, $0s, $0e);
+               }
+             / e:st_logic_and { $$ = e; }
+st_logic_and <- l:st_logic_and sp "&&" sp r:comparison {
+                    $$ = ds_vm_binary(auxil, DS_AST_LOGIC_AND, l, r, $0s, $0e);
+                }
+              / e:comparison { $$ = e; }
+st_name <- < '\'' (escape / !['\\] .)+ '\'' > {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_NAME, NULL, NULL, NULL, $0s, $0e);
+                 if ($$) $$->auxiliary = 1;
+             }
+         / st_ident_start+ (':' st_ident_start+)* {
+                 $$ = ds_vm_ast(auxil, DS_AST_ST_NAME, NULL, NULL, NULL, $0s, $0e);
+             }
+st_ident_start <- [A-Za-z_$] / [^\x00-\x7f]
+
+statements <- h:statement sp semicolons? t:statements {
+                  $$ = ds_vm_chain(h, t);
+              }
+            / h:statement sp semicolons? { $$ = h; }
+            / semicolons sp t:statements { $$ = t; }
+            / { $$ = NULL; }
+
+semicolons <- (';' sp)+
+
+statement <- s:if_statement { $$ = s; }
+           / s:while_statement { $$ = s; }
+           / s:function_statement { $$ = s; }
+           / s:dice_flag_statement { $$ = s; }
+           / s:return_statement { $$ = s; }
+           / keyword_break boundary { $$ = ds_vm_ast(auxil, DS_AST_BREAK, NULL, NULL, NULL, $0s, $0e); }
+           / keyword_continue boundary { $$ = ds_vm_ast(auxil, DS_AST_CONTINUE, NULL, NULL, NULL, $0s, $0e); }
+           / e:assignment { $$ = ds_vm_ast(auxil, DS_AST_EXPR_STMT, e, NULL, NULL, $0s, $0e); }
+
+block <- '{' sp '}' { $$ = ds_vm_ast(auxil, DS_AST_BLOCK, NULL, NULL, NULL, $0s, $0e); }
+       / '{' sp s:statements sp '}' { $$ = ds_vm_ast(auxil, DS_AST_BLOCK, s, NULL, NULL, $0s, $0e); }
+
+if_statement <- keyword_if sp1 c:assignment sp y:block sp keyword_else sp n:if_statement {
+                    $$ = ds_vm_ast(auxil, DS_AST_IF, c, y, n, $0s, $0e);
+                }
+              / keyword_if sp1 c:assignment sp y:block sp keyword_else sp n:block {
+                    $$ = ds_vm_ast(auxil, DS_AST_IF, c, y, n, $0s, $0e);
+                }
+              / keyword_if sp1 c:assignment sp y:block {
+                    $$ = ds_vm_ast(auxil, DS_AST_IF, c, y, NULL, $0s, $0e);
+                }
+
+while_statement <- keyword_while sp1 c:assignment sp b:block {
+                       $$ = ds_vm_ast(auxil, DS_AST_WHILE, c, b, NULL, $0s, $0e);
+                   }
+
+function_statement <- keyword_func sp1 n:identifier_node sp p:parameter_list sp b:block {
+                          $$ = ds_vm_ast(auxil, DS_AST_FUNCTION_DEF, n, p, b, $0s, $0e);
+                      }
+
+dice_flag_statement <- "//" [ \t]* "#EnableDice" [ \t]+ n:identifier_node [ \t]+ "true" (!'\r' !'\n' .)* ('\r\n' / '\n' / '\r' / !.) {
+                           $$ = ds_vm_ast(auxil, DS_AST_DICE_FLAG, n, NULL, NULL, $0s, $0e);
+                           if ($$) $$->auxiliary = 1;
+                       }
+                    / "//" [ \t]* "#EnableDice" [ \t]+ n:identifier_node [ \t]+ "false" (!'\r' !'\n' .)* ('\r\n' / '\n' / '\r' / !.) {
+                           $$ = ds_vm_ast(auxil, DS_AST_DICE_FLAG, n, NULL, NULL, $0s, $0e);
+                           if ($$) $$->auxiliary = 0;
+                       }
+
+parameter_list <- '(' sp ')' { $$ = NULL; }
+                / '(' sp p:identifier_list sp ')' { $$ = p; }
+
+identifier_list <- h:identifier_node sp ',' sp t:identifier_list { $$ = ds_vm_chain(h, t); }
+                 / h:identifier_node { $$ = h; }
+
+return_statement <- keyword_return boundary sp e:assignment {
+                        $$ = ds_vm_ast(auxil, DS_AST_RETURN, e, NULL, NULL, $0s, $0e);
+                    }
+                  / keyword_return boundary {
+                        $$ = ds_vm_ast(auxil, DS_AST_RETURN, NULL, NULL, NULL, $0s, $0e);
+                    }
+
+# Resolve a bare identifier assignment before special-dice parsing (b/p/f/a/c
+# are all legal variable names in upstream DiceScript).
+assignment <- l:identifier_node sp '=' !'=' sp r:assignment {
+                  $$ = ds_vm_ast(auxil, DS_AST_ASSIGN, l, r, NULL, $0s, $0e);
+              }
+            / l:ternary sp '=' !'=' sp r:assignment {
+                  $$ = ds_vm_ast(auxil, DS_AST_ASSIGN, l, r, NULL, $0s, $0e);
+              }
+            / e:ternary { $$ = e; }
+
+ternary <- c:logic_or sp '?' sp y:assignment sp ':' sp n:assignment {
+               $$ = ds_vm_ast(auxil, DS_AST_TERNARY, c, y, n, $0s, $0e);
+           }
+         / h:ternary_case t:ternary_cases {
+               $$ = ds_vm_chain(h, t);
+           }
+         / e:logic_or { $$ = e; }
+
+ternary_case <- c:logic_or sp '?' sp y:logic_or sp {
+                    $$ = ds_vm_ast(auxil, DS_AST_TERNARY, c, y, NULL, $0s, $0e);
+                }
+ternary_cases <- ',' sp h:ternary_case t:ternary_cases { $$ = ds_vm_chain(h, t); }
+               / { $$ = NULL; }
+
+logic_or <- l:logic_or sp "||" sp r:logic_and {
+                $$ = ds_vm_binary(auxil, DS_AST_LOGIC_OR, l, r, $0s, $0e);
+            }
+          / e:logic_and { $$ = e; }
+
+logic_and <- l:logic_and sp "&&" sp r:bitwise_or {
+                 $$ = ds_vm_binary(auxil, DS_AST_LOGIC_AND, l, r, $0s, $0e);
+             }
+           / e:bitwise_or { $$ = e; }
+
+bitwise_or <- l:bitwise_or sp '|' !'|' sp r:bitwise_and {
+                  $$ = ds_vm_binary(auxil, DS_AST_BIT_OR, l, r, $0s, $0e);
+              }
+            / e:bitwise_and { $$ = e; }
+
+bitwise_and <- l:bitwise_and sp '&' !'&' !'(' sp r:comparison {
+                   $$ = ds_vm_binary(auxil, DS_AST_BIT_AND, l, r, $0s, $0e);
+               }
+             / e:comparison { $$ = e; }
+
+comparison <- l:comparison sp "<=" sp r:additive { $$ = ds_vm_binary(auxil, DS_AST_LE, l, r, $0s, $0e); }
+            / l:comparison sp ">=" sp r:additive { $$ = ds_vm_binary(auxil, DS_AST_GE, l, r, $0s, $0e); }
+            / l:comparison sp "==" sp r:additive { $$ = ds_vm_binary(auxil, DS_AST_EQ, l, r, $0s, $0e); }
+            / l:comparison sp "!=" sp r:additive { $$ = ds_vm_binary(auxil, DS_AST_NE, l, r, $0s, $0e); }
+            / l:comparison sp '<' !'=' sp r:additive { $$ = ds_vm_binary(auxil, DS_AST_LT, l, r, $0s, $0e); }
+            / l:comparison sp '>' !'=' sp r:additive { $$ = ds_vm_binary(auxil, DS_AST_GT, l, r, $0s, $0e); }
+            / e:additive { $$ = e; }
+
+additive <- l:additive sp ('+' / "＋") sp r:multiplicative {
+                $$ = ds_vm_binary(auxil, DS_AST_ADD, l, r, $0s, $0e);
+            }
+          / l:additive sp ('-' / "－") sp r:multiplicative {
+                $$ = ds_vm_binary(auxil, DS_AST_SUBTRACT, l, r, $0s, $0e);
+            }
+          / e:multiplicative { $$ = e; }
+
+multiplicative <- l:multiplicative sp ('*' / "＊") !'*' sp r:null_coalescing {
+                      $$ = ds_vm_binary(auxil, DS_AST_MULTIPLY, l, r, $0s, $0e);
+                  }
+                / l:multiplicative sp ('/' / "／") sp r:null_coalescing {
+                      $$ = ds_vm_binary(auxil, DS_AST_DIVIDE, l, r, $0s, $0e);
+                  }
+                / l:multiplicative sp '%' sp r:null_coalescing {
+                      $$ = ds_vm_binary(auxil, DS_AST_MODULUS, l, r, $0s, $0e);
+                  }
+                / e:null_coalescing { $$ = e; }
+
+null_coalescing <- l:null_coalescing sp "??" sp r:power {
+                         $$ = ds_vm_binary(auxil, DS_AST_NULL_COALESCE, l, r, $0s, $0e);
+                     }
+                   / e:power { $$ = e; }
+
+power <- l:power sp ("**" / '^') sp r:unary {
+             $$ = ds_vm_binary(auxil, DS_AST_POWER, l, r, $0s, $0e);
+         }
+       / e:unary { $$ = e; }
+
+unary <- ('+' / "＋") sp e:unary { $$ = ds_vm_ast(auxil, DS_AST_POSITIVE, e, NULL, NULL, $0s, $0e); }
+       / ('-' / "－") sp e:unary { $$ = ds_vm_ast(auxil, DS_AST_NEGATIVE, e, NULL, NULL, $0s, $0e); }
+       / '&' sp '(' sp e:assignment sp ')' { $$ = ds_vm_ast(auxil, DS_AST_COMPUTED, e, NULL, NULL, $0s, $0e); }
+       / '&' sp e:raw_primary { $$ = ds_vm_ast(auxil, DS_AST_RAW, e, NULL, NULL, $0s, $0e); }
+       / e:dice { $$ = e; }
+
+dice <- l:dice sp [dD] sp r:postfix m:dice_modifiers {
+             $$ = ds_vm_ast(auxil, DS_AST_DICE, l, r, m, $0s, $0e);
+         }
+       / [dD] &(sp dice_operand_start) sp r:postfix m:dice_modifiers {
+             $$ = ds_vm_ast(auxil, DS_AST_DICE, NULL, r, m, $0s, $0e);
+         }
+       / e:special_dice { $$ = e; }
+       / e:postfix { $$ = e; }
+
+dice_operand_start <- [0-9.(+\-] / "＋" / "－"
+
+dice_modifiers <- h:dice_modifier t:dice_modifiers { $$ = ds_vm_chain(h, t); }
+                 / { $$ = NULL; }
+
+dice_modifier <- ("kh" / [kK]) sp v:modifier_value { $$ = ds_vm_modifier(auxil, DS_VM_KEEP_HIGH, v, $0s, $0e); }
+               / ("kl" / [qQ]) sp v:modifier_value { $$ = ds_vm_modifier(auxil, DS_VM_KEEP_LOW, v, $0s, $0e); }
+               / "dh" sp v:modifier_value { $$ = ds_vm_modifier(auxil, DS_VM_DROP_HIGH, v, $0s, $0e); }
+               / "dl" sp v:modifier_value { $$ = ds_vm_modifier(auxil, DS_VM_DROP_LOW, v, $0s, $0e); }
+               / ("kh" / [kK]) { $$ = ds_vm_modifier(auxil, DS_VM_KEEP_HIGH, NULL, $0s, $0e); }
+               / ("kl" / [qQ]) { $$ = ds_vm_modifier(auxil, DS_VM_KEEP_LOW, NULL, $0s, $0e); }
+               / "dh" { $$ = ds_vm_modifier(auxil, DS_VM_DROP_HIGH, NULL, $0s, $0e); }
+               / "dl" { $$ = ds_vm_modifier(auxil, DS_VM_DROP_LOW, NULL, $0s, $0e); }
+               / "min" sp v:modifier_value { $$ = ds_vm_modifier(auxil, DS_VM_MIN, v, $0s, $0e); }
+               / "max" sp v:modifier_value { $$ = ds_vm_modifier(auxil, DS_VM_MAX, v, $0s, $0e); }
+               / ("优势" / "優勢") { $$ = ds_vm_modifier(auxil, DS_VM_ADVANTAGE, NULL, $0s, $0e); }
+               / ("劣势" / "劣勢") { $$ = ds_vm_modifier(auxil, DS_VM_DISADVANTAGE, NULL, $0s, $0e); }
+
+modifier_value <- e:primary { $$ = e; }
+
+special_dice <- p:postfix_no_special sp [aA] sp a:postfix_no_special o:wod_options {
+                    $$ = ds_vm_ast(auxil, DS_AST_WOD, p, a, o, $0s, $0e);
+                }
+              / p:postfix_no_special sp [cC] sp c:postfix_no_special o:dc_options {
+                    $$ = ds_vm_ast(auxil, DS_AST_DOUBLE_CROSS, p, c, o, $0s, $0e);
+                }
+              / [bB] n:number boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_BONUS, n, NULL, NULL, $0s, $0e); }
+              / [pP] n:number boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_PENALTY, n, NULL, NULL, $0s, $0e); }
+              / [bB] boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_BONUS, NULL, NULL, NULL, $0s, $0e); }
+              / [pP] boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_PENALTY, NULL, NULL, NULL, $0s, $0e); }
+              / [fF] boundary { $$ = ds_vm_ast(auxil, DS_AST_FATE, NULL, NULL, NULL, $0s, $0e); }
+
+wod_options <- h:wod_option t:wod_options { $$ = ds_vm_chain(h, t); }
+             / { $$ = NULL; }
+wod_option <- [mM] sp v:postfix_no_special {
+                  $$ = ds_vm_ast(auxil, DS_AST_WOD_OPTION, v, NULL, NULL, $0s, $0e); if ($$) $$->auxiliary = 1;
+              }
+            / [kK] sp v:postfix_no_special {
+                  $$ = ds_vm_ast(auxil, DS_AST_WOD_OPTION, v, NULL, NULL, $0s, $0e); if ($$) $$->auxiliary = 2;
+              }
+            / [qQ] sp v:postfix_no_special {
+                  $$ = ds_vm_ast(auxil, DS_AST_WOD_OPTION, v, NULL, NULL, $0s, $0e); if ($$) $$->auxiliary = 3;
+              }
+
+dc_options <- h:dc_option t:dc_options { $$ = ds_vm_chain(h, t); }
+            / { $$ = NULL; }
+dc_option <- [mM] sp v:postfix_no_special {
+                 $$ = ds_vm_ast(auxil, DS_AST_DC_OPTION, v, NULL, NULL, $0s, $0e); if ($$) $$->auxiliary = 1;
+             }
+
+postfix <- b:primary s:suffixes {
+               $$ = s ? ds_vm_ast(auxil, DS_AST_POSTFIX, b, s, NULL, $0s, $0e) : b;
+           }
+
+postfix_no_special <- b:primary s:suffixes {
+                          $$ = s ? ds_vm_ast(auxil, DS_AST_POSTFIX, b, s, NULL, $0s, $0e) : b;
+                      }
+
+raw_primary <- b:raw_base s:suffixes {
+                   $$ = s ? ds_vm_ast(auxil, DS_AST_POSTFIX, b, s, NULL, $0s, $0e) : b;
+               }
+
+raw_base <- e:identifier_node { $$ = e; }
+          / e:this_node { $$ = e; }
+
+suffixes <- h:suffix t:suffixes { $$ = ds_vm_chain(h, t); }
+          / { $$ = NULL; }
+
+suffix <- s:slice_suffix { $$ = s; }
+        / '[' sp i:assignment sp ']' { $$ = ds_vm_ast(auxil, DS_AST_INDEX, i, NULL, NULL, $0s, $0e); }
+        / '.' sp n:identifier_node { $$ = ds_vm_ast(auxil, DS_AST_ATTR, n, NULL, NULL, $0s, $0e); }
+        / '(' sp ')' { $$ = ds_vm_ast(auxil, DS_AST_CALL, NULL, NULL, NULL, $0s, $0e); }
+        / '(' sp a:argument_list sp ')' { $$ = ds_vm_ast(auxil, DS_AST_CALL, a, NULL, NULL, $0s, $0e); }
+        / "kh" n:number { $$ = ds_vm_ast(auxil, DS_AST_ARRAY_KH, n, NULL, NULL, $0s, $0e); }
+        / "kh" boundary { $$ = ds_vm_ast(auxil, DS_AST_ARRAY_KH, NULL, NULL, NULL, $0s, $0e); }
+        / "kl" n:number { $$ = ds_vm_ast(auxil, DS_AST_ARRAY_KL, n, NULL, NULL, $0s, $0e); }
+        / "kl" boundary { $$ = ds_vm_ast(auxil, DS_AST_ARRAY_KL, NULL, NULL, NULL, $0s, $0e); }
+
+slice_suffix <- '[' sp a:maybe_expression sp ':' sp b:maybe_expression sp ':' sp c:maybe_expression sp ']' {
+                    $$ = ds_vm_ast(auxil, DS_AST_SLICE, a, b, c, $0s, $0e);
+                }
+              / '[' sp a:maybe_expression sp ':' sp b:maybe_expression sp ']' {
+                    $$ = ds_vm_ast(auxil, DS_AST_SLICE, a, b, NULL, $0s, $0e);
+                }
+
+maybe_expression <- e:assignment { $$ = e; }
+                  / { $$ = NULL; }
+
+argument_list <- h:assignment sp ',' sp t:argument_list { $$ = ds_vm_chain(h, t); }
+               / h:assignment { $$ = h; }
+
+primary <- e:null_node { $$ = e; }
+         / e:true_node { $$ = e; }
+         / e:false_node { $$ = e; }
+         / e:number { $$ = e; }
+         / e:string_literal { $$ = e; }
+         / e:template_literal { $$ = e; }
+         / e:this_node { $$ = e; }
+         / e:identifier_node { $$ = e; }
+         / e:array_literal { $$ = e; }
+         / e:dict_literal { $$ = e; }
+         / '(' sp e:assignment sp ')' { $$ = e; }
+
+null_node <- "null" boundary { $$ = ds_vm_ast(auxil, DS_AST_NULL, NULL, NULL, NULL, $0s, $0e); }
+true_node <- "true" boundary { $$ = ds_vm_ast(auxil, DS_AST_TRUE, NULL, NULL, NULL, $0s, $0e); }
+false_node <- "false" boundary { $$ = ds_vm_ast(auxil, DS_AST_FALSE, NULL, NULL, NULL, $0s, $0e); }
+this_node <- "this" boundary { $$ = ds_vm_ast(auxil, DS_AST_THIS, NULL, NULL, NULL, $0s, $0e); }
+
+array_literal <- '[' sp ']' { $$ = ds_vm_ast(auxil, DS_AST_ARRAY, NULL, NULL, NULL, $0s, $0e); }
+               / '[' sp a:assignment sp ".." sp b:assignment sp ']' {
+                     $$ = ds_vm_ast(auxil, DS_AST_RANGE, a, b, NULL, $0s, $0e);
+                 }
+               / '[' sp a:argument_list sp ','? ']' {
+                     $$ = ds_vm_ast(auxil, DS_AST_ARRAY, a, NULL, NULL, $0s, $0e);
+                 }
+
+dict_literal <- '{' sp '}' { $$ = ds_vm_ast(auxil, DS_AST_DICT, NULL, NULL, NULL, $0s, $0e); }
+              / '{' sp p:dict_pairs sp ','? '}' { $$ = ds_vm_ast(auxil, DS_AST_DICT, p, NULL, NULL, $0s, $0e); }
+
+dict_pairs <- h:dict_pair sp ',' sp t:dict_pairs { $$ = ds_vm_chain(h, t); }
+            / h:dict_pair { $$ = h; }
+dict_pair <- k:identifier_no_colon_node sp ':' sp v:assignment {
+                 $$ = ds_vm_ast(auxil, DS_AST_PAIR, k, v, NULL, $0s, $0e);
+             }
+           / k:assignment sp ':' sp v:assignment {
+                 $$ = ds_vm_ast(auxil, DS_AST_PAIR, k, v, NULL, $0s, $0e);
+             }
+
+number <- e:float_number { $$ = e; }
+        / e:integer_number { $$ = e; }
+float_number <- [0-9]* '.' [0-9]+ { $$ = ds_vm_ast(auxil, DS_AST_FLOAT, NULL, NULL, NULL, $0s, $0e); }
+integer_number <- [0-9]+ { $$ = ds_vm_ast(auxil, DS_AST_INTEGER, NULL, NULL, NULL, $0s, $0e); }
+
+string_literal <- < '\'' (escape / !['\\] .)* '\'' > {
+                      $$ = ds_vm_ast(auxil, DS_AST_STRING, NULL, NULL, NULL, $0s, $0e);
+                  }
+                / < '"' (escape / !["\\] .)* '"' > {
+                      $$ = ds_vm_ast(auxil, DS_AST_STRING, NULL, NULL, NULL, $0s, $0e);
+                  }
+
+template_literal <- < '`' (escape / ![`\\] .)* '`' > {
+                        $$ = ds_vm_ast(auxil, DS_AST_TEMPLATE, NULL, NULL, NULL, $0s, $0e);
+                    }
+                  / < '\x1e' (escape / ![\x1e\\] .)* '\x1e' > {
+                        $$ = ds_vm_ast(auxil, DS_AST_TEMPLATE, NULL, NULL, NULL, $0s, $0e);
+                    }
+
+escape <- '\\' .
+
+identifier_node <- identifier { $$ = ds_vm_ast(auxil, DS_AST_VARIABLE, NULL, NULL, NULL, $0s, $0e); }
+identifier_no_colon_node <- identifier_no_colon { $$ = ds_vm_ast(auxil, DS_AST_VARIABLE, NULL, NULL, NULL, $0s, $0e); }
+identifier <- !keyword ident_start ident_continue*
+identifier_no_colon <- !keyword ident_start ident_continue_no_colon*
+keyword <- ("while" / "if" / "else" / "continue" / "break" / "return" / "func" / "true" / "false" / "null" / "this") boundary
+keyword_if <- "if" boundary
+keyword_else <- "else" boundary
+keyword_while <- "while" boundary
+keyword_func <- "func" boundary
+keyword_return <- "return" boundary
+keyword_break <- "break" boundary
+keyword_continue <- "continue" boundary
+boundary <- !ident_continue
+ident_start <- [A-Za-z_$] / [^\x00-\x7f]
+ident_continue <- [A-Za-z0-9_$:] / [^\x00-\x7f]
+ident_continue_no_colon <- [A-Za-z0-9_$] / [^\x00-\x7f]
+
+sp <- ([ \t\r\n] / line_comment)*
+sp1 <- ([ \t\r\n] / line_comment)+
+line_comment <- "//" !(sp "#EnableDice") (!'\n' .)* ('\n' / !.)

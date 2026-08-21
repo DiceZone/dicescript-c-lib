@@ -1,0 +1,244 @@
+# DiceScript C99 V1 numeric grammar.
+#
+# This is a deliberately scoped port of sealdice/dicescript roll.peg.  V1 keeps
+# numeric expressions and TRPG dice operators; statements, variables, strings,
+# arrays, dictionaries and functions are reserved for later versions.
+
+%prefix "dsv1"
+%value "ds_node_t *"
+%auxil "ds_parser_state_t *"
+
+%header {
+#include "dicescript_internal.h"
+}
+
+%source {
+#define PCC_GETCHAR(auxil) ds_input_getchar(auxil)
+#define PCC_ERROR(auxil) ds_parser_error(auxil)
+}
+
+input <- space e:expression space !. {
+    auxil->root = e;
+    $$ = e;
+}
+
+expression <- e:ternary { $$ = e; }
+
+ternary <- c:logic_or space '?' space y:expression space ':' space n:expression {
+               $$ = ds_node_new(auxil, DS_NODE_TERNARY, c, y, n, $0s, $0e);
+           }
+         / e:logic_or { $$ = e; }
+
+logic_or <- l:logic_or space "||" space r:logic_and {
+                $$ = ds_node_new(auxil, DS_NODE_LOGIC_OR, l, r, NULL, $0s, $0e);
+            }
+          / e:logic_and { $$ = e; }
+
+logic_and <- l:logic_and space "&&" space r:bitwise_or {
+                 $$ = ds_node_new(auxil, DS_NODE_LOGIC_AND, l, r, NULL, $0s, $0e);
+             }
+           / e:bitwise_or { $$ = e; }
+
+bitwise_or <- l:bitwise_or space '|' !'|' space r:bitwise_and {
+                  $$ = ds_node_new(auxil, DS_NODE_BIT_OR, l, r, NULL, $0s, $0e);
+              }
+            / e:bitwise_and { $$ = e; }
+
+bitwise_and <- l:bitwise_and space '&' !'&' space r:comparison {
+                   $$ = ds_node_new(auxil, DS_NODE_BIT_AND, l, r, NULL, $0s, $0e);
+               }
+             / e:comparison { $$ = e; }
+
+comparison <- l:comparison space "<=" space r:additive {
+                  $$ = ds_node_new(auxil, DS_NODE_LE, l, r, NULL, $0s, $0e);
+              }
+            / l:comparison space ">=" space r:additive {
+                  $$ = ds_node_new(auxil, DS_NODE_GE, l, r, NULL, $0s, $0e);
+              }
+            / l:comparison space "==" space r:additive {
+                  $$ = ds_node_new(auxil, DS_NODE_EQ, l, r, NULL, $0s, $0e);
+              }
+            / l:comparison space "!=" space r:additive {
+                  $$ = ds_node_new(auxil, DS_NODE_NE, l, r, NULL, $0s, $0e);
+              }
+            / l:comparison space '<' space r:additive {
+                  $$ = ds_node_new(auxil, DS_NODE_LT, l, r, NULL, $0s, $0e);
+              }
+            / l:comparison space '>' space r:additive {
+                  $$ = ds_node_new(auxil, DS_NODE_GT, l, r, NULL, $0s, $0e);
+              }
+            / e:additive { $$ = e; }
+
+additive <- l:additive space ('+' / "＋") space r:multiplicative {
+                $$ = ds_node_new(auxil, DS_NODE_ADD, l, r, NULL, $0s, $0e);
+            }
+          / l:additive space ('-' / "－") space r:multiplicative {
+                $$ = ds_node_new(auxil, DS_NODE_SUBTRACT, l, r, NULL, $0s, $0e);
+            }
+          / e:multiplicative { $$ = e; }
+
+multiplicative <- l:multiplicative space ('*' / "＊") space r:power {
+                      $$ = ds_node_new(auxil, DS_NODE_MULTIPLY, l, r, NULL, $0s, $0e);
+                  }
+                / l:multiplicative space ('/' / "／") space r:power {
+                      $$ = ds_node_new(auxil, DS_NODE_DIVIDE, l, r, NULL, $0s, $0e);
+                  }
+                / l:multiplicative space '%' space r:power {
+                      $$ = ds_node_new(auxil, DS_NODE_MODULUS, l, r, NULL, $0s, $0e);
+                  }
+                / e:power { $$ = e; }
+
+power <- l:power space ("**" / '^') space r:unary {
+             $$ = ds_node_new(auxil, DS_NODE_POWER, l, r, NULL, $0s, $0e);
+         }
+       / e:unary { $$ = e; }
+
+unary <- ('+' / "＋") space e:unary {
+             $$ = ds_node_new(auxil, DS_NODE_POSITIVE, e, NULL, NULL, $0s, $0e);
+         }
+       / ('-' / "－") space e:unary {
+             $$ = ds_node_new(auxil, DS_NODE_NEGATIVE, e, NULL, NULL, $0s, $0e);
+         }
+       / e:dice { $$ = e; }
+
+dice <- e:wod { $$ = e; }
+      / e:double_cross { $$ = e; }
+      / e:coc { $$ = e; }
+      / e:fate { $$ = e; }
+      / e:common_dice { $$ = e; }
+
+common_dice <- l:common_dice space [dD] space r:atom m:modifiers {
+                     $$ = ds_node_new(auxil, DS_NODE_DICE, l, r, m, $0s, $0e);
+                 }
+               / l:common_dice space [dD] m:modifiers {
+                     $$ = ds_node_new(auxil, DS_NODE_DICE, l, NULL, m, $0s, $0e);
+                 }
+               / [dD] space r:atom m:modifiers {
+                     $$ = ds_node_new(auxil, DS_NODE_DICE, NULL, r, m, $0s, $0e);
+                 }
+               / [dD] m:modifiers {
+                     $$ = ds_node_new(auxil, DS_NODE_DICE, NULL, NULL, m, $0s, $0e);
+                 }
+               / e:atom { $$ = e; }
+
+modifiers <- a:keep_modifier b:clamp_modifier {
+                 $$ = ds_node_chain(a, b);
+             }
+           / a:keep_modifier { $$ = a; }
+           / a:clamp_modifier { $$ = a; }
+           / { $$ = NULL; }
+
+keep_modifier <- ("kh" / [kK]) v:modifier_value {
+                     $$ = ds_node_modifier(auxil, DS_MOD_KEEP_HIGH, v, $0s, $0e);
+                 }
+               / ("kl" / [qQ]) v:modifier_value {
+                     $$ = ds_node_modifier(auxil, DS_MOD_KEEP_LOW, v, $0s, $0e);
+                 }
+               / "dh" v:modifier_value {
+                     $$ = ds_node_modifier(auxil, DS_MOD_DROP_HIGH, v, $0s, $0e);
+                 }
+               / "dl" v:modifier_value {
+                     $$ = ds_node_modifier(auxil, DS_MOD_DROP_LOW, v, $0s, $0e);
+                 }
+               / ("kh" / [kK]) {
+                     $$ = ds_node_modifier(auxil, DS_MOD_KEEP_HIGH,
+                         ds_node_integer(auxil, "1", $0s, $0e), $0s, $0e);
+                 }
+               / ("kl" / [qQ]) {
+                     $$ = ds_node_modifier(auxil, DS_MOD_KEEP_LOW,
+                         ds_node_integer(auxil, "1", $0s, $0e), $0s, $0e);
+                 }
+               / "dh" {
+                     $$ = ds_node_modifier(auxil, DS_MOD_DROP_HIGH,
+                         ds_node_integer(auxil, "1", $0s, $0e), $0s, $0e);
+                 }
+               / "dl" {
+                     $$ = ds_node_modifier(auxil, DS_MOD_DROP_LOW,
+                         ds_node_integer(auxil, "1", $0s, $0e), $0s, $0e);
+                 }
+               / ("优势" / "優勢") {
+                     $$ = ds_node_modifier(auxil, DS_MOD_ADVANTAGE, NULL, $0s, $0e);
+                 }
+               / ("劣势" / "劣勢") {
+                     $$ = ds_node_modifier(auxil, DS_MOD_DISADVANTAGE, NULL, $0s, $0e);
+                 }
+
+clamp_modifier <- "min" v:modifier_value {
+                      $$ = ds_node_modifier(auxil, DS_MOD_MIN, v, $0s, $0e);
+                  }
+                / "max" v:modifier_value {
+                      $$ = ds_node_modifier(auxil, DS_MOD_MAX, v, $0s, $0e);
+                  }
+
+modifier_value <- e:atom { $$ = e; }
+
+wod <- p:atom space [aA] space a:atom o:wod_options {
+           $$ = ds_node_new(auxil, DS_NODE_WOD, p, a, o, $0s, $0e);
+       }
+     / [aA] space a:atom o:wod_options {
+           $$ = ds_node_new(auxil, DS_NODE_WOD, NULL, a, o, $0s, $0e);
+       }
+
+wod_options <- h:wod_option t:wod_options { $$ = ds_node_chain(h, t); }
+             / { $$ = NULL; }
+
+wod_option <- [mM] v:atom {
+                  $$ = ds_node_new(auxil, DS_NODE_WOD_OPTION, v, NULL, NULL, $0s, $0e);
+                  if ($$ != NULL) $$->auxiliary = DS_WOD_POINTS;
+              }
+            / [kK] v:atom {
+                  $$ = ds_node_new(auxil, DS_NODE_WOD_OPTION, v, NULL, NULL, $0s, $0e);
+                  if ($$ != NULL) $$->auxiliary = DS_WOD_THRESHOLD_GE;
+              }
+            / [qQ] v:atom {
+                  $$ = ds_node_new(auxil, DS_NODE_WOD_OPTION, v, NULL, NULL, $0s, $0e);
+                  if ($$ != NULL) $$->auxiliary = DS_WOD_THRESHOLD_LE;
+              }
+
+double_cross <- p:atom space [cC] space a:atom o:dc_options {
+                    $$ = ds_node_new(auxil, DS_NODE_DOUBLE_CROSS, p, a, o, $0s, $0e);
+                }
+
+dc_options <- h:dc_option t:dc_options { $$ = ds_node_chain(h, t); }
+            / { $$ = NULL; }
+
+dc_option <- [mM] v:atom {
+                 $$ = ds_node_new(auxil, DS_NODE_DC_OPTION, v, NULL, NULL, $0s, $0e);
+                 if ($$ != NULL) $$->auxiliary = DS_WOD_POINTS;
+             }
+
+coc <- [bB] n:atom {
+           $$ = ds_node_new(auxil, DS_NODE_COC_BONUS, n, NULL, NULL, $0s, $0e);
+       }
+     / [pP] n:atom {
+           $$ = ds_node_new(auxil, DS_NODE_COC_PENALTY, n, NULL, NULL, $0s, $0e);
+       }
+     / [bB] {
+           $$ = ds_node_new(auxil, DS_NODE_COC_BONUS,
+               ds_node_integer(auxil, "1", $0s, $0e), NULL, NULL, $0s, $0e);
+       }
+     / [pP] {
+           $$ = ds_node_new(auxil, DS_NODE_COC_PENALTY,
+               ds_node_integer(auxil, "1", $0s, $0e), NULL, NULL, $0s, $0e);
+       }
+
+fate <- [fF] {
+            $$ = ds_node_new(auxil, DS_NODE_FATE, NULL, NULL, NULL, $0s, $0e);
+        }
+
+atom <- e:number { $$ = e; }
+      / '(' space e:expression space ')' { $$ = e; }
+
+number <- e:float_number { $$ = e; }
+        / e:integer_number { $$ = e; }
+
+float_number <- < [0-9]* '.' [0-9]+ > {
+                    $$ = ds_node_float(auxil, $1, $0s, $0e);
+                }
+
+integer_number <- < [0-9]+ > {
+                      $$ = ds_node_integer(auxil, $1, $0s, $0e);
+                  }
+
+space <- ([ \t\r\n] / line_comment)*
+line_comment <- "//" (!'\n' .)* ('\n' / !.)

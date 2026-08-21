@@ -1,0 +1,11 @@
+dicescript-c-lib
+Copyright 2026 Dice!Next contributors
+
+This product includes a scoped C99 adaptation of grammar and dice semantics
+from DiceScript (https://github.com/sealdice/dicescript), licensed under the
+Apache License, Version 2.0. The compatibility baseline used for the initial
+port is commit c4c99fe00cb67463825a54c8c6e928390501a849.
+
+The generated PEG parser is produced with PackCC
+(https://github.com/arithy/packcc). PackCC is licensed under the MIT License;
+its generated parser output may be distributed under this project's license.
