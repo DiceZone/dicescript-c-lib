@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dicescript-c-lib VERSION 0.1.0 LANGUAGES C)
+project(dicescript-c-lib VERSION 0.3.0 LANGUAGES C)
 
 option(DICESCRIPT_BUILD_TESTS "Build DiceScript C99 tests" ON)
 option(DICESCRIPT_BUILD_EXAMPLE "Build DiceScript C99 example" ON)

@@ -6,6 +6,7 @@
 %prefix "dsfull"
 %value "ds_ast_t *"
 %auxil "ds_vm_parser_t *"
+%marker @custom_length
 
 %header {
 #include "dicescript_vm_internal.h"
@@ -16,7 +17,15 @@
 #define PCC_ERROR(auxil) ds_vm_parser_error(auxil)
 }
 
-input <- sp "^st" sp body:st_items sp !. {
+input <- &{ @@ = auxil->allow_trailing; } sp "^st" sp body:st_items sp {
+    auxil->root = ds_vm_ast(auxil, DS_AST_ST_ROOT, body, NULL, NULL, $0s, $0e);
+    $$ = auxil->root;
+}
+      / &{ @@ = auxil->allow_trailing; } sp body:statements sp {
+    auxil->root = ds_vm_ast(auxil, DS_AST_BLOCK, body, NULL, NULL, $0s, $0e);
+    $$ = auxil->root;
+}
+      / sp "^st" sp body:st_items sp !. {
     auxil->root = ds_vm_ast(auxil, DS_AST_ST_ROOT, body, NULL, NULL, $0s, $0e);
     $$ = auxil->root;
 }
@@ -96,23 +105,34 @@ st_name <- < '\'' (escape / !['\\] .)+ '\'' > {
              }
 st_ident_start <- [A-Za-z_$] / [^\x00-\x7f]
 
-statements <- h:statement sp semicolons? t:statements {
+# Simple expressions only continue after a semicolon or line break. Block
+# statements may be followed directly, matching upstream stmtLines.
+statements <- h:statement_with_block sp t:statements {
                   $$ = ds_vm_chain(h, t);
               }
-            / h:statement sp semicolons? { $$ = h; }
+             / h:statement_with_block { $$ = h; }
+             / h:statement_simple s:statement_separator t:statements {
+                   (void)s; $$ = ds_vm_chain(h, t);
+               }
+             / h:statement_simple s:statement_separator { (void)s; $$ = h; }
+             / h:statement_simple { $$ = h; }
             / semicolons sp t:statements { $$ = t; }
-            / { $$ = NULL; }
+            / semicolons { $$ = NULL; }
 
 semicolons <- (';' sp)+
+statement_separator <- semicolons { $$ = NULL; }
+                     / [ \t]* ('\r\n' / '\n' / '\r') sp { $$ = NULL; }
+                     / [ \t]* line_comment sp { $$ = NULL; }
 
-statement <- s:if_statement { $$ = s; }
-           / s:while_statement { $$ = s; }
-           / s:function_statement { $$ = s; }
-           / s:dice_flag_statement { $$ = s; }
-           / s:return_statement { $$ = s; }
-           / keyword_break boundary { $$ = ds_vm_ast(auxil, DS_AST_BREAK, NULL, NULL, NULL, $0s, $0e); }
-           / keyword_continue boundary { $$ = ds_vm_ast(auxil, DS_AST_CONTINUE, NULL, NULL, NULL, $0s, $0e); }
-           / e:assignment { $$ = ds_vm_ast(auxil, DS_AST_EXPR_STMT, e, NULL, NULL, $0s, $0e); }
+statement_with_block <- s:if_statement { $$ = s; }
+                      / s:while_statement { $$ = s; }
+                      / s:function_statement { $$ = s; }
+                      / s:dice_flag_statement { $$ = s; }
+                      / s:return_statement { $$ = s; }
+
+statement_simple <- keyword_break boundary { $$ = ds_vm_ast(auxil, DS_AST_BREAK, NULL, NULL, NULL, $0s, $0e); }
+                  / keyword_continue boundary { $$ = ds_vm_ast(auxil, DS_AST_CONTINUE, NULL, NULL, NULL, $0s, $0e); }
+                  / e:assignment { $$ = ds_vm_ast(auxil, DS_AST_EXPR_STMT, e, NULL, NULL, $0s, $0e); }
 
 block <- '{' sp '}' { $$ = ds_vm_ast(auxil, DS_AST_BLOCK, NULL, NULL, NULL, $0s, $0e); }
        / '{' sp s:statements sp '}' { $$ = ds_vm_ast(auxil, DS_AST_BLOCK, s, NULL, NULL, $0s, $0e); }
@@ -191,12 +211,12 @@ logic_and <- l:logic_and sp "&&" sp r:bitwise_or {
              }
            / e:bitwise_or { $$ = e; }
 
-bitwise_or <- l:bitwise_or sp '|' !'|' sp r:bitwise_and {
+bitwise_or <- &{ @@ = ds_vm_bitwise_enabled(auxil); } l:bitwise_or sp '|' !'|' sp r:bitwise_and {
                   $$ = ds_vm_binary(auxil, DS_AST_BIT_OR, l, r, $0s, $0e);
               }
             / e:bitwise_and { $$ = e; }
 
-bitwise_and <- l:bitwise_and sp '&' !'&' !'(' sp r:comparison {
+bitwise_and <- &{ @@ = ds_vm_bitwise_enabled(auxil); } l:bitwise_and sp '&' !'&' !'(' sp r:comparison {
                    $$ = ds_vm_binary(auxil, DS_AST_BIT_AND, l, r, $0s, $0e);
                }
              / e:comparison { $$ = e; }
@@ -238,20 +258,33 @@ power <- l:power sp ("**" / '^') sp r:unary {
          }
        / e:unary { $$ = e; }
 
-unary <- ('+' / "＋") sp e:unary { $$ = ds_vm_ast(auxil, DS_AST_POSITIVE, e, NULL, NULL, $0s, $0e); }
-       / ('-' / "－") sp e:unary { $$ = ds_vm_ast(auxil, DS_AST_NEGATIVE, e, NULL, NULL, $0s, $0e); }
+unary <- ('+' / "＋") sp e:dice { $$ = ds_vm_ast(auxil, DS_AST_POSITIVE, e, NULL, NULL, $0s, $0e); }
+       / ('-' / "－") sp e:dice { $$ = ds_vm_ast(auxil, DS_AST_NEGATIVE, e, NULL, NULL, $0s, $0e); }
        / '&' sp '(' sp e:assignment sp ')' { $$ = ds_vm_ast(auxil, DS_AST_COMPUTED, e, NULL, NULL, $0s, $0e); }
        / '&' sp e:raw_primary { $$ = ds_vm_ast(auxil, DS_AST_RAW, e, NULL, NULL, $0s, $0e); }
        / e:dice { $$ = e; }
 
-dice <- l:dice sp [dD] sp r:postfix m:dice_modifiers {
+dice <- e:custom_dice { $$ = e; }
+       / l:dice sp [dD] sp r:postfix m:dice_modifiers {
              $$ = ds_vm_ast(auxil, DS_AST_DICE, l, r, m, $0s, $0e);
          }
        / [dD] &(sp dice_operand_start) sp r:postfix m:dice_modifiers {
              $$ = ds_vm_ast(auxil, DS_AST_DICE, NULL, r, m, $0s, $0e);
          }
+       / l:postfix_no_special sp [dD] sp m:dice_modifiers special_dice_boundary {
+             $$ = ds_vm_ast(auxil, DS_AST_DICE, l, NULL, m, $0s, $0e);
+         }
+       / [dD] sp m:dice_modifiers special_dice_boundary {
+             $$ = ds_vm_ast(auxil, DS_AST_DICE, NULL, NULL, m, $0s, $0e);
+         }
        / e:special_dice { $$ = e; }
        / e:postfix { $$ = e; }
+
+custom_dice <- &{ @custom_length = (ptrdiff_t)ds_vm_custom_match(auxil, $0s); @@ = @custom_length > 0; }
+               ( &{ @@ = (ptrdiff_t)($0e - $0s) < @custom_length; } . )+
+               &{ @@ = (ptrdiff_t)($0e - $0s) == @custom_length; } {
+                   $$ = ds_vm_custom_ast(auxil, $0s, $0e);
+               }
 
 dice_operand_start <- [0-9.(+\-] / "＋" / "－"
 
@@ -279,11 +312,13 @@ special_dice <- p:postfix_no_special sp [aA] sp a:postfix_no_special o:wod_optio
               / p:postfix_no_special sp [cC] sp c:postfix_no_special o:dc_options {
                     $$ = ds_vm_ast(auxil, DS_AST_DOUBLE_CROSS, p, c, o, $0s, $0e);
                 }
-              / [bB] n:number boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_BONUS, n, NULL, NULL, $0s, $0e); }
-              / [pP] n:number boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_PENALTY, n, NULL, NULL, $0s, $0e); }
-              / [bB] boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_BONUS, NULL, NULL, NULL, $0s, $0e); }
-              / [pP] boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_PENALTY, NULL, NULL, NULL, $0s, $0e); }
-              / [fF] boundary { $$ = ds_vm_ast(auxil, DS_AST_FATE, NULL, NULL, NULL, $0s, $0e); }
+              / [bB] n:number special_dice_boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_BONUS, n, NULL, NULL, $0s, $0e); }
+              / [pP] n:number special_dice_boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_PENALTY, n, NULL, NULL, $0s, $0e); }
+              / [bB] special_dice_boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_BONUS, NULL, NULL, NULL, $0s, $0e); }
+              / [pP] special_dice_boundary { $$ = ds_vm_ast(auxil, DS_AST_COC_PENALTY, NULL, NULL, NULL, $0s, $0e); }
+              / [fF] special_dice_boundary { $$ = ds_vm_ast(auxil, DS_AST_FATE, NULL, NULL, NULL, $0s, $0e); }
+
+special_dice_boundary <- boundary !('[' / '.' / '(')
 
 wod_options <- h:wod_option t:wod_options { $$ = ds_vm_chain(h, t); }
              / { $$ = NULL; }
@@ -318,7 +353,7 @@ raw_primary <- b:raw_base s:suffixes {
 raw_base <- e:identifier_node { $$ = e; }
           / e:this_node { $$ = e; }
 
-suffixes <- h:suffix t:suffixes { $$ = ds_vm_chain(h, t); }
+suffixes <- sp h:suffix t:suffixes { $$ = ds_vm_chain(h, t); }
           / { $$ = NULL; }
 
 suffix <- s:slice_suffix { $$ = s; }

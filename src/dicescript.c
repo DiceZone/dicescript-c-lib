@@ -211,6 +211,8 @@ static uint64_t ds_next_random(ds_eval_context *ctx) {
 static uint64_t ds_bounded_random(ds_eval_context *ctx, uint64_t upper_bound) {
     uint64_t value;
     if (upper_bound == 0) return 0;
+    if (ctx->options.dice_roll_mode < 0) return 0;
+    if (ctx->options.dice_roll_mode > 0) return upper_bound - 1;
     if (ctx->options.random != NULL) {
         value = ctx->options.random(ctx->options.random_userdata, upper_bound);
         return value < upper_bound ? value : value % upper_bound;
@@ -785,5 +787,5 @@ int dicescript_eval(const char *expression, const dicescript_options *options,
 }
 
 const char *dicescript_version(void) {
-    return "0.2.0";
+    return "0.3.0";
 }

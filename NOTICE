@@ -1,7 +1,7 @@
 dicescript-c-lib
 Copyright 2026 Dice!Next contributors
 
-This product includes a scoped C99 adaptation of grammar and dice semantics
+This product includes a C99 adaptation of the language grammar and runtime semantics
 from DiceScript (https://github.com/sealdice/dicescript), licensed under the
 Apache License, Version 2.0. The compatibility baseline used for the initial
 port is commit c4c99fe00cb67463825a54c8c6e928390501a849.

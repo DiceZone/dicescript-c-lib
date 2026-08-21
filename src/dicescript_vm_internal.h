@@ -63,6 +63,7 @@ typedef enum ds_ast_kind {
     DS_AST_ATTR,
     DS_AST_ARRAY_KH,
     DS_AST_ARRAY_KL,
+    DS_AST_CUSTOM_DICE,
     DS_AST_DICE,
     DS_AST_DICE_MOD,
     DS_AST_COC_BONUS,
@@ -118,6 +119,10 @@ typedef struct ds_vm_parser {
     int parser_error;
     dicescript_error_kind error_kind;
     char error[DICESCRIPT_MAX_ERROR];
+    dicescript_context *context;
+    int allow_trailing;
+    size_t custom_match_length;
+    size_t custom_match_index;
 } ds_vm_parser_t;
 
 int ds_vm_input_getchar(ds_vm_parser_t *state);
@@ -131,5 +136,8 @@ ds_ast_t *ds_vm_binary(ds_vm_parser_t *state, ds_ast_kind kind,
                        size_t start, size_t end);
 ds_ast_t *ds_vm_modifier(ds_vm_parser_t *state, int kind, ds_ast_t *value,
                          size_t start, size_t end);
+int ds_vm_bitwise_enabled(ds_vm_parser_t *state);
+size_t ds_vm_custom_match(ds_vm_parser_t *state, size_t start);
+ds_ast_t *ds_vm_custom_ast(ds_vm_parser_t *state, size_t start, size_t end);
 
 #endif

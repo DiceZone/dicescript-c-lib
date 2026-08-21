@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -40,6 +41,37 @@ typedef struct st_capture {
     st_record items[32];
     size_t count;
 } st_capture;
+
+typedef struct custom_dice_state {
+    char value_json[128];
+    char detail[128];
+    unsigned evaluations;
+} custom_dice_state;
+
+typedef struct native_state {
+    unsigned calls;
+    char self_json[256];
+    char args_json[512];
+    char set_attribute[64];
+    char set_value[256];
+} native_state;
+
+typedef struct detail_callback_state {
+    unsigned span_calls;
+    unsigned root_calls;
+    unsigned make_calls;
+    int saw_load;
+    int saw_computed;
+    char buffer[1024];
+} detail_callback_state;
+
+typedef struct host_hook_state {
+    unsigned pre_calls;
+    unsigned post_calls;
+    unsigned store_calls;
+    char last_store_name[64];
+    char last_store_value[128];
+} host_hook_state;
 
 static uint64_t random_max(void *userdata, uint64_t upper_bound) {
     uint32_t *calls = (uint32_t *)userdata;
@@ -98,6 +130,169 @@ static int capture_st(void *userdata, const char *operation, const char *name,
     snprintf(record->value, sizeof(record->value), "%s", value_json);
     snprintf(record->extra, sizeof(record->extra), "%s", extra_json != NULL ? extra_json : "");
     snprintf(record->operator_text, sizeof(record->operator_text), "%s", operator_text);
+    return 0;
+}
+
+static int match_e_dice(void *userdata, const char *input,
+                        size_t input_length, size_t *consumed_bytes) {
+    size_t i = 1;
+    (void)userdata;
+    if (input_length < 2 || input[0] != 'E' || input[1] < '0' || input[1] > '9') return 0;
+    while (i < input_length && input[i] >= '0' && input[i] <= '9') ++i;
+    *consumed_bytes = i;
+    return 1;
+}
+
+static int eval_e_dice(void *userdata, const char *matched_text,
+                       size_t matched_length,
+                       dicescript_custom_dice_output *output) {
+    custom_dice_state *state = (custom_dice_state *)userdata;
+    char number[64];
+    long value;
+    if (matched_length <= 1 || matched_length >= sizeof(number)) return 0;
+    memcpy(number, matched_text + 1, matched_length - 1);
+    number[matched_length - 1] = '\0';
+    value = strtol(number, NULL, 10);
+    if (value == 13) {
+        output->error = "custom boom";
+        return 0;
+    }
+    ++state->evaluations;
+    snprintf(state->value_json, sizeof(state->value_json),
+             "{\"t\":0,\"v\":%ld}", value * 2);
+    snprintf(state->detail, sizeof(state->detail), "custom:%.*s",
+             (int)matched_length, matched_text);
+    output->value_json = state->value_json;
+    output->detail = state->detail;
+    return 1;
+}
+
+static int native_add(void *userdata, const char *self_json,
+                      const char *args_json,
+                      dicescript_native_output *output) {
+    native_state *state = (native_state *)userdata;
+    ++state->calls;
+    snprintf(state->self_json, sizeof(state->self_json), "%s",
+             self_json != NULL ? self_json : "");
+    snprintf(state->args_json, sizeof(state->args_json), "%s", args_json);
+    output->value_json = "{\"t\":0,\"v\":5}";
+    return 1;
+}
+
+static int native_object_get(void *userdata, const char *attribute,
+                             dicescript_native_output *output) {
+    (void)userdata;
+    if (strcmp(attribute, "hp") == 0) {
+        output->value_json = "{\"t\":0,\"v\":41}";
+        return 1;
+    }
+    if (strcmp(attribute, "add") == 0) {
+        output->value_json = "{\"t\":9,\"v\":{\"name\":\"hostAdd\"}}";
+        return 1;
+    }
+    return 0;
+}
+
+static int native_object_set(void *userdata, const char *attribute,
+                             const char *value_json) {
+    native_state *state = (native_state *)userdata;
+    snprintf(state->set_attribute, sizeof(state->set_attribute), "%s", attribute);
+    snprintf(state->set_value, sizeof(state->set_value), "%s", value_json);
+    return 0;
+}
+
+static int native_object_list(void *userdata,
+                              dicescript_native_output *output) {
+    (void)userdata;
+    output->value_json = "{\"t\":6,\"v\":{\"list\":["
+        "{\"t\":2,\"v\":\"hp\"},{\"t\":2,\"v\":\"add\"}]}}";
+    return 1;
+}
+
+static const char *rewrite_detail_span(
+    void *userdata, const char *default_detail,
+    const dicescript_detail_span_view *span) {
+    detail_callback_state *state = (detail_callback_state *)userdata;
+    ++state->span_calls;
+    if (strcmp(span->tag, "load") == 0) {
+        state->saw_load = 1;
+        snprintf(state->buffer, sizeof(state->buffer), "LOAD<%s>",
+                 default_detail);
+        return state->buffer;
+    }
+    if (strcmp(span->tag, "load.computed") == 0) {
+        state->saw_computed = 1;
+        snprintf(state->buffer, sizeof(state->buffer), "COMPUTED<%s>",
+                 default_detail);
+        return state->buffer;
+    }
+    return NULL;
+}
+
+static const char *rewrite_detail_root(
+    void *userdata, const char *default_detail,
+    const dicescript_detail_span_view *span) {
+    detail_callback_state *state = (detail_callback_state *)userdata;
+    (void)span;
+    ++state->root_calls;
+    return default_detail;
+}
+
+static const char *make_detail(
+    void *userdata, const dicescript_detail_span_view *spans,
+    size_t span_count, const char *source, size_t parsed_length,
+    const char *result) {
+    detail_callback_state *state = (detail_callback_state *)userdata;
+    ++state->make_calls;
+    snprintf(state->buffer, sizeof(state->buffer),
+             "CUSTOM:%.*s:%s:%s", (int)parsed_length, source, result,
+             span_count != 0 ? spans[0].tag : "none");
+    return state->buffer;
+}
+
+static int host_load_pre(void *userdata, const char *name, int is_raw,
+                         dicescript_host_load_pre_output *output) {
+    host_hook_state *state = (host_hook_state *)userdata;
+    (void)is_raw;
+    ++state->pre_calls;
+    if (strcmp(name, "alias") == 0) {
+        output->new_name = "target";
+        return 1;
+    }
+    if (strcmp(name, "forced") == 0) {
+        output->value_json = "{\"t\":0,\"v\":9}";
+        return 1;
+    }
+    return 0;
+}
+
+static int host_load_post(void *userdata, const char *name, int is_raw,
+                          const char *current_value_json,
+                          dicescript_host_load_post_output *output) {
+    host_hook_state *state = (host_hook_state *)userdata;
+    (void)is_raw;
+    ++state->post_calls;
+    if (strcmp(name, "missing") == 0) {
+        CHECK(strstr(current_value_json, "\"t\":4") != NULL);
+        output->value_json = "{\"t\":0,\"v\":123}";
+        return 1;
+    }
+    return 0;
+}
+
+static int host_store_pre(void *userdata, const char *name,
+                          const char *value_json,
+                          dicescript_host_store_pre_output *output) {
+    host_hook_state *state = (host_hook_state *)userdata;
+    ++state->store_calls;
+    snprintf(state->last_store_name, sizeof(state->last_store_name), "%s", name);
+    snprintf(state->last_store_value, sizeof(state->last_store_value), "%s",
+             value_json);
+    if (strcmp(name, "overwrite") == 0) {
+        output->value_json = "{\"t\":0,\"v\":3}";
+        return 0;
+    }
+    if (strcmp(name, "handled") == 0) return 1;
     return 0;
 }
 
@@ -300,6 +495,9 @@ static void test_full_vm_expression_boundary(void) {
     dicescript_context *context = new_context();
     dicescript_script_result result;
     memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_run_complete(context, "1+2 trailing reason", &result));
+
+    memset(&result, 0, sizeof(result));
     CHECK(!dicescript_context_eval(context, "a=1; a", &result));
     CHECK(result.error_kind == DICESCRIPT_ERROR_UNSUPPORTED_SYNTAX);
     CHECK(dicescript_context_eval(context, "1+2*3", &result));
@@ -361,6 +559,11 @@ static void test_upstream_core_corpus(void) {
     expect_text(context, "toInt(-1.9)", "-1");
     expect_text(context, "[1.2,2,3]kh", "3");
     expect_text(context, "[4.1,3.1,1]kl", "1");
+    expect_text(context, "2*[1,2]", "[1, 2, 1, 2]");
+    expect_text(context, "{'a':1,'b':[2]}=={'b':[2],'a':1}", "1");
+    expect_text(context, "&(1+2)==&(1+2)", "1");
+    expect_text(context, "dir([1])", "['kh', 'kl', 'sum', 'len', 'shuffle', 'rand', 'randSize', 'pop', 'shift', 'push']");
+    expect_text(context, "dir({'own':1})", "['keys', 'values', 'items', 'len', 'has', 'get', 'getRaw']");
 
     memset(&result, 0, sizeof(result));
     CHECK(!dicescript_context_run(context, "while 1 {}", &result));
@@ -551,6 +754,402 @@ static void test_upstream_st_syntax(void) {
     dicescript_context_destroy(context);
 }
 
+static void test_upstream_default_dice(void) {
+    dicescript_runtime_options options;
+    dicescript_context *context;
+    dicescript_script_result result;
+    dicescript_default_runtime_options(&options);
+    options.dice.random = random_max;
+    context = dicescript_context_create(&options);
+    expect_text(context, "d", "100");
+    expect_text(context, "3d", "300");
+    expect_text(context, "d优势", "100");
+    dicescript_context_destroy(context);
+
+    dicescript_default_runtime_options(&options);
+    options.dice.random = random_max;
+    strcpy(options.default_dice_side_expression, "12d1-11");
+    context = dicescript_context_create(&options);
+    expect_text(context, "d", "1");
+    dicescript_context_destroy(context);
+
+    dicescript_default_runtime_options(&options);
+    options.enable_default_dice = 0;
+    context = dicescript_context_create(&options);
+    result = run_script(context, "d");
+    CHECK(result.ok && result.type == DICESCRIPT_VALUE_NULL);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_custom_dice(void) {
+    dicescript_context *context = new_context();
+    dicescript_script_result result;
+    custom_dice_state state;
+    memset(&state, 0, sizeof(state));
+    CHECK(dicescript_context_register_custom_dice(context, "E dice",
+                                                  match_e_dice, eval_e_dice,
+                                                  &state));
+    result = run_script(context, "E5");
+    CHECK(result.ok && result.integer == 10 && state.evaluations == 1);
+    CHECK(strstr(result.detail, "custom:E5") != NULL);
+    result = run_script(context, "E5+1");
+    CHECK(result.ok && result.integer == 11 && state.evaluations == 2);
+    result = run_script(context, "Efoo");
+    CHECK(result.ok && result.type == DICESCRIPT_VALUE_NULL);
+
+    memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_run(context, "E13", &result));
+    CHECK(result.error_kind == DICESCRIPT_ERROR_EVALUATION &&
+          strstr(result.error, "custom boom") != NULL);
+
+    dicescript_context_clear_custom_dice(context);
+    result = run_script(context, "E5");
+    CHECK(result.ok && result.type == DICESCRIPT_VALUE_NULL);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_native_function_and_object(void) {
+    dicescript_context *context = new_context();
+    dicescript_native_object_callbacks callbacks;
+    dicescript_script_result result;
+    native_state state;
+    char serialized[512];
+    memset(&state, 0, sizeof(state));
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.get = native_object_get;
+    callbacks.set = native_object_set;
+    callbacks.list = native_object_list;
+    callbacks.userdata = &state;
+
+    CHECK(dicescript_context_register_native_function(context, "hostAdd",
+                                                       native_add, &state));
+    result = run_script(context, "hostAdd(2,3)");
+    CHECK(result.ok && result.type == DICESCRIPT_VALUE_INT && result.integer == 5);
+    CHECK(state.calls == 1 && state.self_json[0] == '\0');
+    CHECK(strcmp(state.args_json,
+        "{\"t\":6,\"v\":{\"list\":[{\"t\":0,\"v\":2},{\"t\":0,\"v\":3}]}}") == 0);
+
+    CHECK(dicescript_context_set_native_object(context, "obj", "demo", &callbacks));
+    result = run_script(context, "obj.hp");
+    CHECK(result.ok && result.integer == 41);
+    result = run_script(context, "obj.add(1,2)");
+    CHECK(result.ok && result.integer == 5 && state.calls == 2);
+    CHECK(strcmp(state.self_json, "{\"t\":10,\"v\":{\"name\":\"demo\"}}") == 0);
+
+    result = run_script(context, "obj.hp=9");
+    CHECK(result.ok && result.integer == 9);
+    CHECK(strcmp(state.set_attribute, "hp") == 0);
+    CHECK(strcmp(state.set_value, "{\"t\":0,\"v\":9}") == 0);
+    result = run_script(context, "dir(obj)");
+    CHECK(result.ok && strcmp(result.text, "['hp', 'add']") == 0);
+
+    memset(serialized, 0, sizeof(serialized));
+    CHECK(dicescript_context_get_serialized(context, "obj", serialized,
+                                             sizeof(serialized)));
+    CHECK(strcmp(serialized, "{\"t\":10,\"v\":{\"name\":\"demo\"}}") == 0);
+    CHECK(dicescript_context_set_serialized(context, "shell",
+        "{\"t\":10,\"v\":{\"name\":\"detached\"}}", &result));
+    result = run_script(context, "shell");
+    CHECK(result.ok && strcmp(result.text, "nobject detached") == 0);
+    result = run_script(context, "shell.unknown");
+    CHECK(result.ok && result.type == DICESCRIPT_VALUE_NULL);
+
+    dicescript_context_clear_native_functions(context);
+    memset(&result, 0, sizeof(result));
+    (void)dicescript_context_run(context, "hostAdd(1,2)", &result);
+    CHECK(!result.ok);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_prefix_and_rest_input(void) {
+    dicescript_context *context = new_context();
+    dicescript_script_result result;
+
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "1+2 trailing reason", &result));
+    CHECK(result.type == DICESCRIPT_VALUE_INT && result.integer == 3);
+    CHECK(result.consumed_bytes == 3);
+    CHECK(strcmp(result.matched, "1+2") == 0);
+    CHECK(strcmp(result.rest, " trailing reason") == 0);
+
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "1+2   ", &result));
+    CHECK(result.consumed_bytes == 3 && strcmp(result.rest, "   ") == 0);
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run(context, "1+2 because test", &result));
+    CHECK(result.integer == 3 && strcmp(result.matched, "1+2") == 0 &&
+          strcmp(result.rest, " because test") == 0);
+
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "1 2", &result));
+    CHECK(result.integer == 1 && strcmp(result.rest, " 2") == 0);
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "i=0 if 1 {i=3}", &result));
+    CHECK(strcmp(result.rest, " if 1 {i=3}") == 0);
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "i=0; if 1 {i=3}; i", &result));
+    CHECK(result.integer == 3 && result.rest[0] == '\0');
+
+    expect_text(context, "a=[1,2]; a [1]", "2");
+    expect_text(context, "obj={}; obj  .  xx=1; obj.xx", "1");
+    memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_run(context, "--1", &result));
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "3d1 k2", &result));
+    CHECK(result.integer == 3 && strcmp(result.rest, " k2") == 0);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_runtime_flags(void) {
+    dicescript_runtime_options options;
+    dicescript_context *context;
+    dicescript_script_result result;
+    uint32_t calls = 0;
+
+    dicescript_default_runtime_options(&options);
+    options.ignore_divide_by_zero = 1;
+    context = dicescript_context_create(&options);
+    expect_text(context, "7/0", "7");
+    dicescript_context_destroy(context);
+
+    dicescript_default_runtime_options(&options);
+    options.disable_bitwise_operations = 1;
+    context = dicescript_context_create(&options);
+    memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_eval(context, "1|2", &result));
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run_prefix(context, "1|2 reason", &result));
+    CHECK(result.integer == 1 && strcmp(result.rest, "|2 reason") == 0);
+    dicescript_context_destroy(context);
+
+    dicescript_default_runtime_options(&options);
+    options.dice.random = random_min;
+    options.dice.random_userdata = &calls;
+    options.dice.dice_roll_mode = 1;
+    context = dicescript_context_create(&options);
+    expect_text(context, "2d6", "12");
+    CHECK(calls == 0);
+    dicescript_context_destroy(context);
+
+    dicescript_default_runtime_options(&options);
+    options.dice.random = random_max;
+    options.dice.random_userdata = &calls;
+    options.dice.dice_roll_mode = -1;
+    context = dicescript_context_create(&options);
+    expect_text(context, "2d6", "2");
+    CHECK(calls == 0);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_detail_spans(void) {
+    dicescript_runtime_options options;
+    dicescript_context *context;
+    dicescript_script_result result;
+
+    dicescript_default_runtime_options(&options);
+    options.dice.dice_roll_mode = 1;
+    context = dicescript_context_create(&options);
+    CHECK(context != NULL);
+
+    result = run_script(context, "d1");
+    CHECK(result.ok && strcmp(result.detail, "") == 0);
+    result = run_script(context, "2d1");
+    CHECK(result.ok && strcmp(result.detail, "2[2d1=1+1]") == 0);
+    result = run_script(context, "(2d1)d1");
+    CHECK(result.ok && strcmp(result.detail,
+                              "2[(2d1)d1=1+1,2d1=2]") == 0);
+    result = run_script(context, "d + 2d");
+    CHECK(result.ok && strcmp(result.detail,
+                              "100[D100] + 200[2D100=100+100]") == 0);
+    result = run_script(context, "d + 1");
+    CHECK(result.ok && strcmp(result.detail, "100[D100] + 1") == 0);
+    result = run_script(context, "d");
+    CHECK(result.ok && strcmp(result.detail, "100[D100]") == 0);
+    result = run_script(context, "2dk1");
+    CHECK(result.ok && strcmp(result.detail,
+                              "100[2D100kh1={100 | 100}]") == 0);
+    result = run_script(context, "a=1;a");
+    CHECK(result.ok && strcmp(result.detail, "a=1;1") == 0);
+
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_set_serialized(context, "a",
+        "{\"t\":5,\"v\":{\"expr\":\"4d1\",\"attrs\":{}}}", &result));
+    result = run_script(context, "a");
+    CHECK(result.ok && strcmp(result.detail,
+        "4[a=4[4d1=1+1+1+1]=4]") == 0);
+
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_detail_callbacks(void) {
+    dicescript_context *context = new_context();
+    dicescript_script_result result;
+    dicescript_detail_callbacks callbacks;
+    detail_callback_state state;
+    memset(&callbacks, 0, sizeof(callbacks));
+    memset(&state, 0, sizeof(state));
+    callbacks.span_rewrite = rewrite_detail_span;
+    callbacks.root_rewrite = rewrite_detail_root;
+    callbacks.userdata = &state;
+    dicescript_context_set_detail_callbacks(context, &callbacks);
+
+    CHECK(dicescript_context_set_int(context, "x", 5));
+    result = run_script(context, "x");
+    CHECK(result.ok && strcmp(result.detail, "5LOAD<>") == 0);
+    CHECK(state.saw_load && state.span_calls == 1 && state.root_calls == 1);
+
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_set_serialized(context, "a",
+        "{\"t\":5,\"v\":{\"expr\":\"4d1\",\"attrs\":{}}}", &result));
+    result = run_script(context, "a");
+    CHECK(result.ok && strcmp(result.detail,
+        "4COMPUTED<[a=4[4d1=1+1+1+1]=4]>") == 0);
+    CHECK(state.saw_computed);
+
+    memset(&state, 0, sizeof(state));
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.make = make_detail;
+    callbacks.span_rewrite = rewrite_detail_span;
+    callbacks.userdata = &state;
+    dicescript_context_set_detail_callbacks(context, &callbacks);
+    result = run_script(context, "2d1");
+    CHECK(result.ok && strcmp(result.detail,
+                              "CUSTOM:2d1:2:dice") == 0);
+    CHECK(state.make_calls == 1 && state.span_calls == 0);
+
+    dicescript_context_set_detail_callbacks(context, NULL);
+    result = run_script(context, "2d1");
+    CHECK(result.ok && strcmp(result.detail, "2[2d1=1+1]") == 0);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_host_intercept_hooks(void) {
+    dicescript_context *context = new_context();
+    dicescript_host_callbacks callbacks;
+    dicescript_script_result result;
+    host_hook_state state;
+    memset(&callbacks, 0, sizeof(callbacks));
+    memset(&state, 0, sizeof(state));
+    callbacks.load_pre = host_load_pre;
+    callbacks.load_post = host_load_post;
+    callbacks.store_pre = host_store_pre;
+    callbacks.userdata = &state;
+    dicescript_context_set_host_callbacks(context, &callbacks);
+    CHECK(dicescript_context_set_int(context, "target", 7));
+
+    result = run_script(context, "alias");
+    CHECK(result.ok && result.integer == 7);
+    result = run_script(context, "forced");
+    CHECK(result.ok && result.integer == 9);
+    result = run_script(context, "missing");
+    CHECK(result.ok && result.integer == 123);
+    result = run_script(context, "toStr(1)");
+    CHECK(result.ok && strcmp(result.text, "1") == 0);
+
+    result = run_script(context, "overwrite=1");
+    CHECK(result.ok && strstr(state.last_store_value, "\"v\":1") != NULL);
+    result = run_script(context, "&overwrite");
+    CHECK(result.ok && result.integer == 3);
+    result = run_script(context, "handled=8");
+    CHECK(result.ok);
+
+    dicescript_context_set_host_callbacks(context, NULL);
+    result = run_script(context, "handled");
+    CHECK(result.ok && result.type == DICESCRIPT_VALUE_NULL);
+    CHECK(state.pre_calls != 0 && state.post_calls != 0 &&
+          state.store_calls >= 2);
+    dicescript_context_destroy(context);
+}
+
+static void test_upstream_extended_corpus(void) {
+    dicescript_context *context = new_context();
+    dicescript_script_result result;
+
+    expect_text(context, "null ?? 5", "5");
+    expect_text(context, "10 ?? 5", "10");
+    expect_text(context, "2 ** 3", "8");
+    expect_text(context, "+3.14", "3.14");
+    expect_text(context, "'\\'test\\''", "'test'");
+    expect_text(context, "\"\\\"test\\\"\"", "\"test\"");
+    expect_text(context, "`test \\{ test \\}`", "test { test }");
+    expect_text(context, "`12\\f3`", "12\f3");
+
+    expect_text(context, "func empty() { return }; empty()", "null");
+    expect_text(context, "if 1 {} 2", "2");
+    expect_text(context, "1; if 1 {}; 2", "2");
+    expect_text(context, "a={}; a[1]=10; toStr(a[1])", "10");
+    expect_text(context, "a=[0,0,0]; i=0; while i<3 {a[i]=i+1; i=i+1} a",
+                "[1, 2, 3]");
+    expect_text(context, "func fib(n) { if n<2 { return n }; return fib(n-1)+fib(n-2) }; fib(8)",
+                "21");
+    expect_text(context, "a=[1,2]; 5||a.push(3); a", "[1, 2]");
+    expect_text(context, "a=[1,2]; 5&&a.push(3); a", "[1, 2, 3]");
+    expect_text(context, "'中文测试'[-3:3]", "文测");
+    expect_text(context, "`{1} {2} {% 3;4;5;6 %}`", "1 2 6");
+    expect_text(context, "$t（测试）=1; $t（测试）", "1");
+
+    memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_run(context, "", &result));
+    memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_run(context, "while", &result));
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_run(context, "i=0 if 1 {i=3}", &result));
+    CHECK(strcmp(result.rest, " if 1 {i=3}") == 0);
+
+    dicescript_context_destroy(context);
+
+    {
+        dicescript_runtime_options options;
+        dicescript_default_runtime_options(&options);
+        options.enable_dice_fate = 1;
+        context = dicescript_context_create(&options);
+        result = run_script(context, "f1");
+        CHECK(result.ok && result.type == DICESCRIPT_VALUE_NULL && result.rest[0] == '\0');
+        dicescript_context_destroy(context);
+    }
+}
+static void test_full_vm_validation_and_samples(void) {
+    dicescript_runtime_options options;
+    dicescript_context *context;
+    dicescript_script_result result;
+    uint32_t calls = 0;
+    dicescript_default_runtime_options(&options);
+    options.dice.random = random_max;
+    options.dice.random_userdata = &calls;
+    context = dicescript_context_create(&options);
+    CHECK(context != NULL);
+
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_validate_expression(
+        context, "[1, 2, 3].sum() + 2d6", &result));
+    CHECK(result.ok && calls == 0 && result.dice_rolls == 0 &&
+          result.sample_count == 0);
+    memset(&result, 0, sizeof(result));
+    CHECK(!dicescript_context_validate_expression(
+        context, "a=1; a+1", &result));
+    CHECK(result.error_kind == DICESCRIPT_ERROR_UNSUPPORTED_SYNTAX && calls == 0);
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_validate_script(
+        context, "a=1; func twice(x) { return x*2 }; twice(a)", &result));
+    CHECK(result.ok && calls == 0);
+    memset(&result, 0, sizeof(result));
+    CHECK(dicescript_context_validate_expression_prefix(
+        context, "[1, 2, 3].sum() + 2d6 attack", &result));
+    CHECK(result.ok && calls == 0);
+    CHECK(strcmp(result.matched, "[1, 2, 3].sum() + 2d6") == 0);
+    CHECK(strcmp(result.rest, " attack") == 0);
+    CHECK(result.consumed_bytes == strlen("[1, 2, 3].sum() + 2d6"));
+
+
+    result = run_script(context, "2d6 + d4");
+    CHECK(result.ok && result.integer == 16 && calls == 3);
+    CHECK(result.dice_rolls == 3 && result.sample_count == 3);
+    CHECK(result.samples[0] == 6 && result.samples[1] == 6 &&
+          result.samples[2] == 4);
+    dicescript_context_destroy(context);
+}
+
+
 int main(void) {
     test_arithmetic();
     test_common_dice();
@@ -566,6 +1165,16 @@ int main(void) {
     test_upstream_tagged_serialization();
     test_upstream_host_value_callbacks();
     test_upstream_st_syntax();
+    test_upstream_default_dice();
+    test_upstream_custom_dice();
+    test_upstream_native_function_and_object();
+    test_upstream_prefix_and_rest_input();
+    test_upstream_runtime_flags();
+    test_upstream_detail_spans();
+    test_upstream_detail_callbacks();
+    test_full_vm_validation_and_samples();
+    test_upstream_host_intercept_hooks();
+    test_upstream_extended_corpus();
     if (failures != 0) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

@@ -60,6 +60,39 @@
 
 #define PCC_VOID_VALUE (~(size_t)0)
 
+#define pcc_marker_variable__integer(ctx, varname) \
+    (ctx->mvars.curr.set.varname.curr.integer)
+#define pcc_marker_variable__get_string(ctx, varname) \
+    ((const char *const)ctx->mvars.curr.set.varname.curr.string.p)
+#define pcc_marker_variable__set_string(ctx, varname, str) \
+    do { \
+        pcc_context_t *const c = ctx; \
+        const char *const s = str; \
+        const size_t l = strlen(s) + 1; \
+        pcc_char_array_t *const a = &(c->mvars.curr.set.varname.curr.string); \
+        pcc_char_array__resize(auxil, a, l); \
+        memcpy(a->p, s, l); \
+    } while (0)
+#define pcc_marker_variable__append_string(ctx, varname, str) \
+    do { \
+        pcc_context_t *const c = ctx; \
+        const char *const s = str; \
+        const size_t l = strlen(s) + 1; \
+        pcc_char_array_t *const a = &(c->mvars.curr.set.varname.curr.string); \
+        const size_t n = a->n; \
+        const size_t k = (n > 0 && !a->p[n - 1]) ? n - 1 : n; \
+        pcc_char_array__resize(auxil, a, k + l); \
+        memcpy(a->p + k, s, l); \
+    } while (0)
+#define pcc_marker_variable__save(ctx, varname) \
+    pcc_marker_value_record__save(auxil, &(ctx->mvars.curr.set.varname))
+#define pcc_marker_variable__restore(ctx, varname) \
+    pcc_marker_value_record__restore(auxil, &(ctx->mvars.curr.set.varname))
+#define pcc_marker_variable__integer_on_action(ctx, varname) \
+    ((const ptrdiff_t)(pcc_in->data.leaf.mvars.varname.integer))
+#define pcc_marker_variable__get_string_on_action(ctx, varname) \
+    ((const char *const)pcc_in->data.leaf.mvars.varname.string.p)
+
 typedef enum pcc_bool_tag {
     PCC_FALSE = 0,
     PCC_TRUE
@@ -106,6 +139,44 @@ typedef struct pcc_capture_const_table_tag {
     const pcc_capture_t **p;
 } pcc_capture_const_table_t;
 
+typedef struct pcc_marker_value_tag {
+    ptrdiff_t integer;
+    pcc_char_array_t string;
+} pcc_marker_value_t;
+
+typedef struct pcc_marker_value_stack_tag {
+    size_t m, n;
+    pcc_marker_value_t *p;
+} pcc_marker_value_stack_t;
+
+typedef struct pcc_marker_value_record_tag {
+    pcc_marker_value_t curr;
+    pcc_marker_value_stack_t prev;
+} pcc_marker_value_record_t;
+
+typedef struct pcc_marker_variable_set_tag {
+    pcc_marker_value_record_t custom_length;
+} pcc_marker_variable_set_t;
+
+typedef struct pcc_marker_variable_set_entry_tag {
+    size_t pos;
+    pcc_marker_variable_set_t set;
+} pcc_marker_variable_set_entry_t;
+
+typedef struct pcc_marker_variable_set_stack_tag {
+    size_t m, n;
+    pcc_marker_variable_set_entry_t *p;
+} pcc_marker_variable_set_stack_t;
+
+typedef struct pcc_marker_variable_set_record_tag {
+    pcc_marker_variable_set_entry_t curr;
+    pcc_marker_variable_set_stack_t prev;
+} pcc_marker_variable_set_record_t;
+
+typedef struct pcc_marker_value_set_tag {
+    pcc_marker_value_t custom_length;
+} pcc_marker_value_set_t;
+
 typedef struct pcc_thunk_tag pcc_thunk_t;
 typedef struct pcc_thunk_array_tag pcc_thunk_array_t;
 
@@ -120,6 +191,7 @@ typedef struct pcc_thunk_leaf_tag {
     pcc_value_refer_table_t values;
     pcc_capture_const_table_t capts;
     pcc_capture_t capt0;
+    pcc_marker_value_set_t mvars;
     pcc_action_t action;
 } pcc_thunk_leaf_t;
 
@@ -147,6 +219,7 @@ struct pcc_thunk_array_tag {
 typedef struct pcc_thunk_chunk_tag {
     pcc_value_table_t values;
     pcc_capture_table_t capts;
+    pcc_marker_variable_set_entry_t mvars;
     pcc_thunk_array_t thunks;
     size_t pos; /* the starting position in the character buffer */
 } pcc_thunk_chunk_t;
@@ -251,6 +324,7 @@ struct dsfull_context_tag {
     pcc_lr_stack_t lrstack;
     pcc_thunk_array_t thunks;
     pcc_capture_t capt0; /* used only for programmable predicates */
+    pcc_marker_variable_set_record_t mvars;
     pcc_auxil_t auxil;
     pcc_memory_recycler_t thunk_recycler;
     pcc_memory_recycler_t thunk_chunk_recycler;
@@ -338,6 +412,12 @@ static void pcc_char_array__add(pcc_auxil_t auxil, pcc_char_array_t *obj, char c
         obj->m = m;
     }
     obj->p[obj->n++] = ch;
+}
+
+static void pcc_char_array__copy(pcc_auxil_t auxil, pcc_char_array_t *obj, const pcc_char_array_t *src) {
+    if (obj == src) return;
+    pcc_char_array__resize(auxil, obj, src->n);
+    if (src->n > 0) memcpy(obj->p, src->p, src->n);
 }
 
 static void pcc_value_table__initialize(pcc_auxil_t auxil, pcc_value_table_t *obj) {
@@ -453,6 +533,244 @@ static void pcc_capture_const_table__resize(pcc_auxil_t auxil, pcc_capture_const
     obj->n = len;
 }
 
+static void pcc_marker_value__initialize(pcc_auxil_t auxil, pcc_marker_value_t *obj) {
+    obj->integer = 0;
+    pcc_char_array__initialize(auxil, &(obj->string));
+}
+
+static void pcc_marker_value__finalize(pcc_auxil_t auxil, pcc_marker_value_t *obj) {
+    pcc_char_array__finalize(auxil, &(obj->string));
+}
+
+static void pcc_marker_value__copy(pcc_auxil_t auxil, pcc_marker_value_t *obj, const pcc_marker_value_t *src) {
+    if (obj == src) return;
+    obj->integer = src->integer;
+    pcc_char_array__copy(auxil, &(obj->string), &(src->string));
+}
+
+static void pcc_marker_value_stack__initialize(pcc_auxil_t auxil, pcc_marker_value_stack_t *obj) {
+    obj->m = 0;
+    obj->n = 0;
+    obj->p = NULL;
+}
+
+static void pcc_marker_value_stack__finalize(pcc_auxil_t auxil, pcc_marker_value_stack_t *obj) {
+    while (obj->n > 0) {
+        obj->n--;
+        pcc_marker_value__finalize(auxil, &(obj->p[obj->n]));
+    }
+    PCC_FREE(auxil, obj->p);
+}
+
+static void pcc_marker_value_stack__resize(pcc_auxil_t auxil, pcc_marker_value_stack_t *obj, size_t len) {
+    size_t i;
+    for (i = len; i < obj->n; i++) pcc_marker_value__finalize(auxil, &(obj->p[i]));
+    if (obj->m < len) {
+        size_t m = obj->m;
+        if (m == 0) m = PCC_ARRAY_MIN_SIZE;
+        while (m < len && m != 0) m <<= 1;
+        if (m == 0) m = len;
+        obj->p = (pcc_marker_value_t *)PCC_REALLOC(ctx->auxil, obj->p, sizeof(pcc_marker_value_t) * m);
+        obj->m = m;
+    }
+    for (i = obj->n; i < len; i++) pcc_marker_value__initialize(auxil, &obj->p[i]);
+    obj->n = len;
+}
+
+static void pcc_marker_value_stack__copy(pcc_auxil_t auxil, pcc_marker_value_stack_t *obj, const pcc_marker_value_stack_t *src) {
+    size_t i;
+    if (obj == src) return;
+    pcc_marker_value_stack__resize(auxil, obj, src->n);
+    for (i = 0; i < obj->n; i++) pcc_marker_value__copy(auxil, &(obj->p[i]), &(src->p[i]));
+}
+
+static void pcc_marker_value_stack__push(pcc_auxil_t auxil, pcc_marker_value_stack_t *obj, const pcc_marker_value_t *mval) {
+    const size_t n = obj->n;
+    pcc_marker_value_stack__resize(auxil, obj, n + 1);
+    pcc_marker_value__copy(auxil, &(obj->p[n]), mval);
+}
+
+static void pcc_marker_value_stack__pop(pcc_auxil_t auxil, pcc_marker_value_stack_t *obj, pcc_marker_value_t *mval) {
+    if (mval) {
+        pcc_marker_value__finalize(auxil, mval);
+        if (obj->n > 0) {
+            const size_t n = obj->n - 1;
+            *mval = obj->p[n]; /* move (not copy) for efficiency */
+            pcc_marker_value__initialize(auxil, &(obj->p[n]));
+            pcc_marker_value_stack__resize(auxil, obj, n);
+        }
+        else {
+            pcc_marker_value__initialize(auxil, mval);
+        }
+    }
+    else {
+        if (obj->n > 0) pcc_marker_value_stack__resize(auxil, obj, obj->n - 1);
+    }
+}
+
+static void pcc_marker_value_record__initialize(pcc_auxil_t auxil, pcc_marker_value_record_t *obj) {
+    pcc_marker_value__initialize(auxil, &(obj->curr));
+    pcc_marker_value_stack__initialize(auxil, &(obj->prev));
+}
+
+static void pcc_marker_value_record__finalize(pcc_auxil_t auxil, pcc_marker_value_record_t *obj) {
+    pcc_marker_value__finalize(auxil, &(obj->curr));
+    pcc_marker_value_stack__finalize(auxil, &(obj->prev));
+}
+
+static void pcc_marker_value_record__copy(pcc_auxil_t auxil, pcc_marker_value_record_t *obj, const pcc_marker_value_record_t *src) {
+    if (obj == src) return;
+    pcc_marker_value__copy(auxil, &(obj->curr), &(src->curr));
+    pcc_marker_value_stack__copy(auxil, &(obj->prev), &(src->prev));
+}
+
+MARK_FUNC_AS_USED
+static void pcc_marker_value_record__save(pcc_auxil_t auxil, pcc_marker_value_record_t *obj) {
+    pcc_marker_value_stack__push(auxil, &(obj->prev), &(obj->curr));
+}
+
+MARK_FUNC_AS_USED
+static void pcc_marker_value_record__restore(pcc_auxil_t auxil, pcc_marker_value_record_t *obj) {
+    pcc_marker_value_stack__pop(auxil, &(obj->prev), &(obj->curr));
+}
+
+static void pcc_marker_variable_set__initialize(pcc_auxil_t auxil, pcc_marker_variable_set_t *obj) {
+    pcc_marker_value_record__initialize(auxil, &(obj->custom_length));
+}
+
+static void pcc_marker_variable_set__finalize(pcc_auxil_t auxil, pcc_marker_variable_set_t *obj) {
+    pcc_marker_value_record__finalize(auxil, &(obj->custom_length));
+}
+
+static void pcc_marker_variable_set__copy(pcc_auxil_t auxil, pcc_marker_variable_set_t *obj, const pcc_marker_variable_set_t *src) {
+    if (obj == src) return;
+    pcc_marker_value_record__copy(auxil, &(obj->custom_length), &(src->custom_length));
+}
+
+static void pcc_marker_variable_set_entry__initialize(pcc_auxil_t auxil, pcc_marker_variable_set_entry_t *obj) {
+    obj->pos = 0;
+    pcc_marker_variable_set__initialize(auxil, &(obj->set));
+}
+
+static void pcc_marker_variable_set_entry__finalize(pcc_auxil_t auxil, pcc_marker_variable_set_entry_t *obj) {
+    pcc_marker_variable_set__finalize(auxil, &(obj->set));
+}
+
+static void pcc_marker_variable_set_entry__copy(pcc_auxil_t auxil, pcc_marker_variable_set_entry_t *obj, const pcc_marker_variable_set_entry_t *src) {
+    if (obj == src) return;
+    obj->pos = src->pos;
+    pcc_marker_variable_set__copy(auxil, &(obj->set), &(src->set));
+}
+
+static void pcc_marker_variable_set_stack__initialize(pcc_auxil_t auxil, pcc_marker_variable_set_stack_t *obj) {
+    obj->m = 0;
+    obj->n = 0;
+    obj->p = NULL;
+}
+
+static void pcc_marker_variable_set_stack__finalize(pcc_auxil_t auxil, pcc_marker_variable_set_stack_t *obj) {
+    while (obj->n > 0) {
+        obj->n--;
+        pcc_marker_variable_set_entry__finalize(auxil, &(obj->p[obj->n]));
+    }
+    PCC_FREE(auxil, obj->p);
+}
+
+static void pcc_marker_variable_set_stack__resize(pcc_auxil_t auxil, pcc_marker_variable_set_stack_t *obj, size_t len) {
+    size_t i;
+    for (i = len; i < obj->n; i++) pcc_marker_variable_set_entry__finalize(auxil, &(obj->p[i]));
+    if (obj->m < len) {
+        size_t m = obj->m;
+        if (m == 0) m = PCC_ARRAY_MIN_SIZE;
+        while (m < len && m != 0) m <<= 1;
+        if (m == 0) m = len;
+        obj->p = (pcc_marker_variable_set_entry_t *)PCC_REALLOC(ctx->auxil, obj->p, sizeof(pcc_marker_variable_set_entry_t) * m);
+        obj->m = m;
+    }
+    for (i = obj->n; i < len; i++) pcc_marker_variable_set_entry__initialize(auxil, &obj->p[i]);
+    obj->n = len;
+}
+
+static void pcc_marker_variable_set_stack__push(pcc_auxil_t auxil, pcc_marker_variable_set_stack_t *obj, const pcc_marker_variable_set_entry_t *mval) {
+    const size_t n = obj->n;
+    pcc_marker_variable_set_stack__resize(auxil, obj, n + 1);
+    pcc_marker_variable_set_entry__copy(auxil, &(obj->p[n]), mval);
+}
+
+static void pcc_marker_variable_set_stack__pop(pcc_auxil_t auxil, pcc_marker_variable_set_stack_t *obj, pcc_marker_variable_set_entry_t *mval) {
+    if (mval) {
+        pcc_marker_variable_set_entry__finalize(auxil, mval);
+        if (obj->n > 0) {
+            const size_t n = obj->n - 1;
+            *mval = obj->p[n]; /* move (not copy) for efficiency */
+            pcc_marker_variable_set_entry__initialize(auxil, &(obj->p[n]));
+            pcc_marker_variable_set_stack__resize(auxil, obj, n);
+        }
+        else {
+            pcc_marker_variable_set_entry__initialize(auxil, mval);
+        }
+    }
+    else {
+        if (obj->n > 0) pcc_marker_variable_set_stack__resize(auxil, obj, obj->n - 1);
+    }
+}
+
+static void pcc_marker_variable_set_record__initialize(pcc_auxil_t auxil, pcc_marker_variable_set_record_t *obj) {
+    pcc_marker_variable_set_entry__initialize(auxil, &(obj->curr));
+    pcc_marker_variable_set_stack__initialize(auxil, &(obj->prev));
+}
+
+static void pcc_marker_variable_set_record__finalize(pcc_auxil_t auxil, pcc_marker_variable_set_record_t *obj) {
+    pcc_marker_variable_set_entry__finalize(auxil, &(obj->curr));
+    pcc_marker_variable_set_stack__finalize(auxil, &(obj->prev));
+}
+
+static void pcc_marker_variable_set_record__save(pcc_auxil_t auxil, pcc_marker_variable_set_record_t *obj, size_t pos) {
+    if (obj->curr.pos < pos) {
+        pcc_marker_variable_set_stack__push(auxil, &(obj->prev), &(obj->curr));
+        obj->curr.pos = pos;
+    }
+}
+
+MARK_FUNC_AS_USED
+static void pcc_marker_variable_set_record__restore(pcc_auxil_t auxil, pcc_marker_variable_set_record_t *obj, size_t pos) {
+    if (obj->curr.pos > pos) {
+        size_t n = obj->prev.n;
+        while (n > 0 && obj->prev.p[n - 1].pos > pos) n--;
+        pcc_marker_variable_set_stack__resize(auxil, &(obj->prev), n);
+        pcc_marker_variable_set_stack__pop(auxil, &(obj->prev), &(obj->curr));
+    }
+}
+
+static void pcc_marker_variable_set_record__shift(pcc_auxil_t auxil, pcc_marker_variable_set_record_t *obj, size_t pos) {
+    size_t k;
+    for (k = 0; k < obj->prev.n && obj->prev.p[k].pos <= pos; k++);
+    if (k > 0) k--;
+    if (k > 0) {
+        size_t i;
+        for (i = k; i < obj->prev.n; i++) {
+            pcc_marker_variable_set_entry__finalize(auxil, &(obj->prev.p[i - k]));
+            obj->prev.p[i - k] = obj->prev.p[i];
+            pcc_marker_variable_set_entry__initialize(auxil, &(obj->prev.p[i]));
+        }
+        pcc_marker_variable_set_stack__resize(auxil, &(obj->prev), obj->prev.n - k);
+    }
+    /* obj->prev.p[0].pos <= pos when obj->prev.n > 0 */
+    /* obj->prev.p[1].pos >  pos when obj->prev.n > 1 */
+}
+
+static void pcc_marker_value_set__initialize(pcc_auxil_t auxil, pcc_marker_value_set_t *obj) {
+    pcc_marker_value__initialize(auxil, &(obj->custom_length));
+}
+
+static void pcc_marker_value_set__finalize(pcc_auxil_t auxil, pcc_marker_value_set_t *obj) {
+    pcc_marker_value__finalize(auxil, &(obj->custom_length));
+}
+
+static void pcc_marker_value_set__copy_from(pcc_auxil_t auxil, pcc_marker_value_set_t *obj, pcc_marker_variable_set_t *src) {
+    pcc_marker_value__copy(auxil, &(obj->custom_length), &(src->custom_length.curr));
+}
+
 static void pcc_memory_recycler__initialize(pcc_auxil_t auxil, pcc_memory_recycler_t *obj, size_t element_size) {
     obj->pool_list = NULL;
     obj->entry_list = NULL;
@@ -508,6 +826,7 @@ static pcc_thunk_t *pcc_thunk__create_leaf(pcc_context_t *ctx, pcc_action_t acti
     pcc_capture_const_table__initialize(ctx->auxil, &(obj->data.leaf.capts));
     pcc_capture_const_table__resize(ctx->auxil, &(obj->data.leaf.capts), captc);
     pcc_capture__initialize(ctx->auxil, &(obj->data.leaf.capt0));
+    pcc_marker_value_set__initialize(ctx->auxil, &(obj->data.leaf.mvars));
     obj->data.leaf.action = action;
     return obj;
 }
@@ -527,6 +846,7 @@ static void pcc_thunk__destroy(pcc_context_t *ctx, pcc_thunk_t *obj) {
         pcc_value_refer_table__finalize(ctx->auxil, &(obj->data.leaf.values));
         pcc_capture_const_table__finalize(ctx->auxil, &(obj->data.leaf.capts));
         pcc_capture__finalize(ctx->auxil, &(obj->data.leaf.capt0));
+        pcc_marker_value_set__finalize(ctx->auxil, &(obj->data.leaf.mvars));
         break;
     case PCC_THUNK_NODE:
         break;
@@ -581,6 +901,7 @@ static pcc_thunk_chunk_t *pcc_thunk_chunk__create(pcc_context_t *ctx) {
     pcc_thunk_chunk_t *const obj = (pcc_thunk_chunk_t *)pcc_memory_recycler__supply(ctx->auxil, &(ctx->thunk_chunk_recycler));
     pcc_value_table__initialize(ctx->auxil, &(obj->values));
     pcc_capture_table__initialize(ctx->auxil, &(obj->capts));
+    pcc_marker_variable_set_entry__initialize(ctx->auxil, &(obj->mvars));
     pcc_thunk_array__initialize(ctx, &(obj->thunks));
     obj->pos = 0;
     return obj;
@@ -590,6 +911,7 @@ static void pcc_thunk_chunk__destroy(pcc_context_t *ctx, pcc_thunk_chunk_t *obj)
     if (obj == NULL) return;
     pcc_value_table__finalize(ctx->auxil, &(obj->values));
     pcc_capture_table__finalize(ctx->auxil, &(obj->capts));
+    pcc_marker_variable_set_entry__finalize(ctx->auxil, &(obj->mvars));
     pcc_thunk_array__finalize(ctx, &(obj->thunks));
     pcc_memory_recycler__recycle(ctx->auxil, &(ctx->thunk_chunk_recycler), obj);
 }
@@ -927,6 +1249,7 @@ static pcc_context_t *pcc_context__create(pcc_auxil_t auxil) {
     pcc_lr_stack__initialize(auxil, &(ctx->lrstack));
     pcc_thunk_array__initialize(ctx, &(ctx->thunks));
     pcc_capture__initialize(ctx->auxil, &(ctx->capt0));
+    pcc_marker_variable_set_record__initialize(ctx->auxil, &(ctx->mvars));
     pcc_memory_recycler__initialize(auxil, &(ctx->thunk_recycler), sizeof(pcc_thunk_t));
     pcc_memory_recycler__initialize(auxil, &(ctx->thunk_chunk_recycler), sizeof(pcc_thunk_chunk_t));
     pcc_memory_recycler__initialize(auxil, &(ctx->lr_head_recycler), sizeof(pcc_lr_head_t));
@@ -944,6 +1267,7 @@ static void pcc_context__destroy(pcc_context_t *ctx) {
     pcc_lr_stack__finalize(ctx->auxil, &(ctx->lrstack));
     pcc_thunk_array__finalize(ctx, &(ctx->thunks));
     pcc_capture__finalize(ctx->auxil, &(ctx->capt0));
+    pcc_marker_variable_set_record__finalize(ctx->auxil, &(ctx->mvars));
     pcc_memory_recycler__finalize(ctx->auxil, &(ctx->thunk_recycler));
     pcc_memory_recycler__finalize(ctx->auxil, &(ctx->thunk_chunk_recycler));
     pcc_memory_recycler__finalize(ctx->auxil, &(ctx->lr_head_recycler));
@@ -970,6 +1294,7 @@ static void pcc_commit_buffer(pcc_context_t *ctx) {
     ctx->pos += ctx->cur;
     pcc_lr_table__shift(ctx, &(ctx->lrtable), ctx->cur);
     ctx->cur = 0;
+    pcc_marker_variable_set_record__shift(ctx->auxil, &(ctx->mvars), ctx->pos);
 }
 
 static const char *pcc_get_capture_string(pcc_context_t *ctx, const pcc_capture_t *capt) {
@@ -1059,6 +1384,7 @@ static pcc_bool_t pcc_apply_rule(pcc_context_t *ctx, pcc_rule_t rule, pcc_thunk_
             default: /* unknown */
                 break;
             }
+            if (c) pcc_marker_variable_set_entry__copy(ctx->auxil, &(ctx->mvars.curr), &(c->mvars));
         }
         else {
             pcc_lr_entry_t *const e = pcc_lr_entry__create(ctx, rule);
@@ -1199,6 +1525,104 @@ static pcc_value_t *pcc_ref_leaf_variable_(pcc_context_t *ctx, pcc_thunk_t *in, 
     return in->data.leaf.values.p[index];
 }
 
+static void pcc_predicate_input_0(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_progpred_out = auxil->allow_trailing;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
+static void pcc_predicate_input_1(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_progpred_out = auxil->allow_trailing;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
+static void pcc_predicate_bitwise_or_0(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_progpred_out = ds_vm_bitwise_enabled(auxil);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
+static void pcc_predicate_bitwise_and_0(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_progpred_out = ds_vm_bitwise_enabled(auxil);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
+static void pcc_predicate_custom_dice_0(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_marker_variable__integer(pcc_ctx, custom_length) = (ptrdiff_t)ds_vm_custom_match(auxil, pcc_capture__0s); pcc_progpred_out = pcc_marker_variable__integer(pcc_ctx, custom_length) > 0;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
+static void pcc_predicate_custom_dice_1(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_progpred_out = (ptrdiff_t)(pcc_capture__0e - pcc_capture__0s) < pcc_marker_variable__integer(pcc_ctx, custom_length);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
+static void pcc_predicate_custom_dice_2(dsfull_context_t *pcc_ctx, pcc_thunk_chunk_t *pcc_in, int *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_progpred_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_capture_0_(pcc_ctx)
+#define pcc_capture__0s pcc_ref_capture_0s_(pcc_ctx)
+#define pcc_capture__0e pcc_ref_capture_0e_(pcc_ctx)
+    pcc_progpred_out = (ptrdiff_t)(pcc_capture__0e - pcc_capture__0s) == pcc_marker_variable__integer(pcc_ctx, custom_length);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_progpred_out
+#undef auxil
+}
+
 static void pcc_action_input_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
@@ -1217,6 +1641,40 @@ static void pcc_action_input_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, p
 }
 
 static void pcc_action_input_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define body (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    auxil->root = ds_vm_ast(auxil, DS_AST_BLOCK, body, NULL, NULL, pcc_capture__0s, pcc_capture__0e);
+    pcc_action_out = auxil->root;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef body
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_input_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define body (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    auxil->root = ds_vm_ast(auxil, DS_AST_ST_ROOT, body, NULL, NULL, pcc_capture__0s, pcc_capture__0e);
+    pcc_action_out = auxil->root;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef body
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_input_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define body (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
@@ -1700,6 +2158,60 @@ static void pcc_action_statements_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_
 static void pcc_action_statements_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
+#define h (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
+#define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 2))
+#define t (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    (void)s; pcc_action_out = ds_vm_chain(h, t);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef t
+#undef s
+#undef h
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_statements_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define h (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
+#define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 2))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    (void)s; pcc_action_out = h;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef s
+#undef h
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_statements_4(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define h (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = h;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef h
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_statements_5(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
 #define t (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
 #define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
@@ -1713,7 +2225,7 @@ static void pcc_action_statements_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_
 #undef auxil
 }
 
-static void pcc_action_statements_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statements_6(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
@@ -1727,7 +2239,49 @@ static void pcc_action_statements_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_
 #undef auxil
 }
 
-static void pcc_action_statement_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_separator_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = NULL;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_statement_separator_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = NULL;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_statement_separator_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = NULL;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_statement_with_block_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
@@ -1743,7 +2297,7 @@ static void pcc_action_statement_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_with_block_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
@@ -1759,7 +2313,7 @@ static void pcc_action_statement_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_with_block_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
@@ -1775,7 +2329,7 @@ static void pcc_action_statement_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_with_block_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
@@ -1791,7 +2345,7 @@ static void pcc_action_statement_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_4(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_with_block_4(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define s (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
@@ -1807,7 +2361,7 @@ static void pcc_action_statement_4(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_5(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_simple_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
@@ -1821,7 +2375,7 @@ static void pcc_action_statement_5(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_6(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_simple_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
@@ -1835,10 +2389,10 @@ static void pcc_action_statement_6(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_i
 #undef auxil
 }
 
-static void pcc_action_statement_7(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_statement_simple_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
-#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
+#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
 #define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
 #define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
@@ -2794,9 +3348,25 @@ static void pcc_action_unary_4(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, p
 static void pcc_action_dice_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
-#define l (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
-#define r (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
-#define m (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 2))
+#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = e;
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef e
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_dice_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define l (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
+#define r (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 2))
+#define m (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 3))
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
 #define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
 #define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
@@ -2811,11 +3381,11 @@ static void pcc_action_dice_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pc
 #undef auxil
 }
 
-static void pcc_action_dice_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_dice_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
-#define r (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
-#define m (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 2))
+#define r (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 2))
+#define m (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 3))
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
 #define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
 #define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
@@ -2829,10 +3399,44 @@ static void pcc_action_dice_1(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pc
 #undef auxil
 }
 
-static void pcc_action_dice_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_dice_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
-#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 3))
+#define l (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 1))
+#define m (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 3))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = ds_vm_ast(auxil, DS_AST_DICE, l, NULL, m, pcc_capture__0s, pcc_capture__0e);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef m
+#undef l
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_dice_4(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define m (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 3))
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = ds_vm_ast(auxil, DS_AST_DICE, NULL, NULL, m, pcc_capture__0s, pcc_capture__0e);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
+#undef m
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_dice_5(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
 #define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
 #define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
@@ -2845,10 +3449,10 @@ static void pcc_action_dice_2(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pc
 #undef auxil
 }
 
-static void pcc_action_dice_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+static void pcc_action_dice_6(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
 #define auxil pcc_ref_auxil_(pcc_ctx)
 #define pcc_action_out (*pcc_out)
-#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 3))
+#define e (*pcc_ref_leaf_variable_(pcc_ctx, pcc_in, 0))
 #define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
 #define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
 #define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
@@ -2857,6 +3461,20 @@ static void pcc_action_dice_3(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pc
 #undef pcc_capture__0s
 #undef pcc_capture__0
 #undef e
+#undef pcc_action_out
+#undef auxil
+}
+
+static void pcc_action_custom_dice_0(dsfull_context_t *pcc_ctx, pcc_thunk_t *pcc_in, pcc_value_t *pcc_out) {
+#define auxil pcc_ref_auxil_(pcc_ctx)
+#define pcc_action_out (*pcc_out)
+#define pcc_capture__0 pcc_ref_leaf_capture_0_(pcc_ctx, pcc_in)
+#define pcc_capture__0s pcc_ref_leaf_capture_0s_(pcc_ctx, pcc_in)
+#define pcc_capture__0e pcc_ref_leaf_capture_0e_(pcc_ctx, pcc_in)
+    pcc_action_out = ds_vm_custom_ast(auxil, pcc_capture__0s, pcc_capture__0e);
+#undef pcc_capture__0e
+#undef pcc_capture__0s
+#undef pcc_capture__0
 #undef pcc_action_out
 #undef auxil
 }
@@ -4250,7 +4868,9 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ident_start(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_statements(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_semicolons(pcc_context_t *ctx);
-static pcc_thunk_chunk_t *pcc_evaluate_rule_statement(pcc_context_t *ctx);
+static pcc_thunk_chunk_t *pcc_evaluate_rule_statement_separator(pcc_context_t *ctx);
+static pcc_thunk_chunk_t *pcc_evaluate_rule_statement_with_block(pcc_context_t *ctx);
+static pcc_thunk_chunk_t *pcc_evaluate_rule_statement_simple(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_block(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_if_statement(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_while_statement(pcc_context_t *ctx);
@@ -4274,11 +4894,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_null_coalescing(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_power(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_dice(pcc_context_t *ctx);
+static pcc_thunk_chunk_t *pcc_evaluate_rule_custom_dice(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_operand_start(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifiers(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_modifier_value(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx);
+static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice_boundary(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_wod_options(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_wod_option(pcc_context_t *ctx);
 static pcc_thunk_chunk_t *pcc_evaluate_rule_dc_options(pcc_context_t *ctx);
@@ -4337,6 +4959,15 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_input(pcc_context_t *ctx) {
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
+        {
+            int r = 1;
+            pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            ctx->capt0.range.start = chunk->pos;
+            ctx->capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+            pcc_predicate_input_0(ctx, chunk, &r);
+            if (!r) goto L0002;
+        }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '^' ||
@@ -4348,32 +4979,54 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_input(pcc_context_t *ctx) {
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_items, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         {
-            const size_t p = ctx->cur;
-            {
-                int u;
-                const size_t n = pcc_get_char_as_utf32(ctx, &u);
-                if (n == 0) goto L0003;
-                ctx->cur += n;
-            }
-            ctx->cur = p;
-            goto L0002;
-        L0003:;
-            ctx->cur = p;
-        }
-        {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_input_0, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        {
+            int r = 1;
+            pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            ctx->capt0.range.start = chunk->pos;
+            ctx->capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+            pcc_predicate_input_1(ctx, chunk, &r);
+            if (!r) goto L0003;
+        }
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_input_1, 1, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0003:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
+        if (
+            pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '^' ||
+            pcc_refill_buffer(ctx, 2) < 2 || (ctx->buffer.p + ctx->cur)[1] != 's' ||
+            pcc_refill_buffer(ctx, 3) < 3 || (ctx->buffer.p + ctx->cur)[2] != 't'
+        ) goto L0004;
+        ctx->cur += 3;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_items, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
         {
             const size_t p = ctx->cur;
@@ -4384,27 +5037,64 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_input(pcc_context_t *ctx) {
                 ctx->cur += n;
             }
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0004;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_input_1, 1, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_input_2, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
+        {
+            const size_t p = ctx->cur;
+            {
+                int u;
+                const size_t n = pcc_get_char_as_utf32(ctx, &u);
+                if (n == 0) goto L0007;
+                ctx->cur += n;
+            }
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            goto L0006;
+        L0007:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        }
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_input_3, 1, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0006:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "input", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -4438,6 +5128,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_items(pcc_context_t *ctx) {
             goto L0004;
         L0003:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         L0004:;
         }
@@ -4450,11 +5141,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_items(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_item, &(chunk->thunks), &(chunk->values.p[0]))) goto L0005;
         {
@@ -4463,17 +5156,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_items(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_items", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -4510,6 +5206,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0003;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -4519,6 +5216,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0003;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0003:;
@@ -4532,11 +5230,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
@@ -4559,6 +5259,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0007;
         L0008:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -4568,6 +5269,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0007;
         L0009:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0006;
         L0007:;
@@ -4582,11 +5284,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0010;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0010;
@@ -4607,6 +5311,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0011;
         L0012:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -4616,6 +5321,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0011;
         L0013:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0010;
         L0011:;
@@ -4629,11 +5335,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0014;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0014;
@@ -4651,11 +5359,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0014:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0015;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0015;
@@ -4673,11 +5383,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0015:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0016;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0016;
@@ -4695,11 +5407,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0016:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0017;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0017;
@@ -4717,11 +5431,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0017:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0018;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0018;
@@ -4736,6 +5452,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0019;
         L0020:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -4745,6 +5462,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             goto L0019;
         L0021:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0018;
         L0019:;
@@ -4758,11 +5476,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0018:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_name, &(chunk->thunks), &(chunk->values.p[0]))) goto L0022;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0022;
@@ -4774,17 +5494,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_item(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0022:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_item", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -4807,10 +5530,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_value(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_value", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -4854,11 +5579,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ternary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_ternary_case, &(chunk->thunks), &(chunk->values.p[3]))) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_ternary_cases, &(chunk->thunks), &(chunk->values.p[4]))) goto L0003;
@@ -4869,11 +5596,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ternary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_logic_or, &(chunk->thunks), &(chunk->values.p[5]))) goto L0004;
         {
@@ -4882,17 +5611,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ternary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_ternary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -4925,10 +5657,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ternary_case(pcc_context_t *ctx) 
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_ternary_case", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -4962,23 +5696,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ternary_cases(pcc_context_t *ctx)
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_st_ternary_cases_1, 2, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_ternary_cases", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -5008,11 +5746,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_logic_or(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_st_logic_and, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
         {
@@ -5021,17 +5761,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_logic_or(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_logic_or", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5066,11 +5809,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_logic_and(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
         {
@@ -5079,17 +5824,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_logic_and(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_logic_and", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5130,6 +5878,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                         goto L0004;
                     L0005:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         {
                             const size_t p = ctx->cur;
@@ -5144,9 +5893,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                                 ctx->cur += n;
                             }
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                             goto L0006;
                         L0007:;
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         }
                         {
                             int u;
@@ -5157,6 +5908,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                         goto L0004;
                     L0006:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         goto L0003;
                     L0004:;
@@ -5165,11 +5917,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                     continue;
                 L0003:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                     break;
                 }
                 if (i < 1) {
                     ctx->cur = p0;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                     goto L0002;
                 }
@@ -5190,11 +5944,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p0 = ctx->cur;
@@ -5209,11 +5965,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                 continue;
             L0009:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
             if (i < 1) {
                 ctx->cur = p0;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                 goto L0008;
             }
@@ -5241,11 +5999,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                         continue;
                     L0011:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         break;
                     }
                     if (i < 1) {
                         ctx->cur = p0;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                         goto L0010;
                     }
@@ -5254,6 +6014,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
                 continue;
             L0010:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
@@ -5263,17 +6024,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_name(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_name", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5305,6 +6069,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ident_start(pcc_context_t *ctx) {
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -5318,12 +6083,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_st_ident_start(pcc_context_t *ctx) {
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "st_ident_start", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5337,92 +6104,138 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_statements(pcc_context_t *ctx) {
     chunk->pos = ctx->cur;
     PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "statements", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
     ctx->level++;
-    pcc_value_table__resize(ctx->auxil, &(chunk->values), 2);
+    pcc_value_table__resize(ctx->auxil, &(chunk->values), 3);
     pcc_value_table__clear(ctx->auxil, &(chunk->values));
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_with_block, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
-        {
-            MARK_VAR_AS_USED
-            const size_t p = ctx->cur;
-            MARK_VAR_AS_USED
-            const size_t n = chunk->thunks.n;
-            if (!pcc_apply_rule(ctx, pcc_evaluate_rule_semicolons, &(chunk->thunks), NULL)) goto L0003;
-            goto L0004;
-        L0003:;
-            ctx->cur = p;
-            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        L0004:;
-        }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_0, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_0, 3, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0005;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0005;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_with_block, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
-            MARK_VAR_AS_USED
-            const size_t p = ctx->cur;
-            MARK_VAR_AS_USED
-            const size_t n = chunk->thunks.n;
-            if (!pcc_apply_rule(ctx, pcc_evaluate_rule_semicolons, &(chunk->thunks), NULL)) goto L0006;
-            goto L0007;
-        L0006:;
-            ctx->cur = p;
-            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        L0007:;
-        }
-        {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_1, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_1, 3, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0003:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_simple, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_separator, &(chunk->thunks), &(chunk->values.p[2]))) goto L0004;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[1]))) goto L0004;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_2, 3, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.values.p[2] = &(chunk->values.p[2]);
+            thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0004:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_simple, &(chunk->thunks), &(chunk->values.p[0]))) goto L0005;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_separator, &(chunk->thunks), &(chunk->values.p[2]))) goto L0005;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_3, 3, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.values.p[2] = &(chunk->values.p[2]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_semicolons, &(chunk->thunks), NULL)) goto L0008;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0008;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[1]))) goto L0008;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statement_simple, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_2, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_4, 3, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0006:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_semicolons, &(chunk->thunks), NULL)) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_statements, &(chunk->thunks), &(chunk->values.p[1]))) goto L0007;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_5, 3, 0);
             thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0007:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_semicolons, &(chunk->thunks), NULL)) goto L0008;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_6, 3, 0);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statements_3, 2, 0);
-            thunk->data.leaf.capt0.range.start = chunk->pos;
-            thunk->data.leaf.capt0.range.end = ctx->cur;
-            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
-            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
-        }
+        goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "statements", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
+L0000:;
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "statements", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_thunk_chunk__destroy(ctx, chunk);
+    return NULL;
 }
 
 static pcc_thunk_chunk_t *pcc_evaluate_rule_semicolons(pcc_context_t *ctx) {
@@ -5448,17 +6261,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_semicolons(pcc_context_t *ctx) {
             continue;
         L0001:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
         if (i < 1) {
             ctx->cur = p0;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
             goto L0000;
         }
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "semicolons", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5467,129 +6283,319 @@ L0000:;
     return NULL;
 }
 
-static pcc_thunk_chunk_t *pcc_evaluate_rule_statement(pcc_context_t *ctx) {
+static pcc_thunk_chunk_t *pcc_evaluate_rule_statement_separator(pcc_context_t *ctx) {
     pcc_thunk_chunk_t *const chunk = pcc_thunk_chunk__create(ctx);
     chunk->pos = ctx->cur;
-    PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
+    PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "statement_separator", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
     ctx->level++;
-    pcc_value_table__resize(ctx->auxil, &(chunk->values), 2);
+    {
+        const size_t p = ctx->cur;
+        const size_t n = chunk->thunks.n;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_semicolons, &(chunk->thunks), NULL)) goto L0002;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_separator_0, 0, 0);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0002:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        {
+            for (;;) {
+                const size_t p = ctx->cur;
+                MARK_VAR_AS_USED
+                const size_t n = chunk->thunks.n;
+                {
+                    int u;
+                    const size_t n = pcc_get_char_as_utf32(ctx, &u);
+                    if (n == 0) goto L0004;
+                    if (!(
+                        u == 0x000020 ||
+                        u == 0x000009
+                    )) goto L0004;
+                    ctx->cur += n;
+                }
+                if (ctx->cur == p) break;
+                continue;
+            L0004:;
+                ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+                pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+                break;
+            }
+        }
+        {
+            const size_t p = ctx->cur;
+            const size_t n = chunk->thunks.n;
+            if (
+                pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\r' ||
+                pcc_refill_buffer(ctx, 2) < 2 || (ctx->buffer.p + ctx->cur)[1] != '\n'
+            ) goto L0006;
+            ctx->cur += 2;
+            goto L0005;
+        L0006:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            if (
+                pcc_refill_buffer(ctx, 1) < 1 ||
+                ctx->buffer.p[ctx->cur] != '\n'
+            ) goto L0007;
+            ctx->cur++;
+            goto L0005;
+        L0007:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            if (
+                pcc_refill_buffer(ctx, 1) < 1 ||
+                ctx->buffer.p[ctx->cur] != '\r'
+            ) goto L0008;
+            ctx->cur++;
+            goto L0005;
+        L0008:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            goto L0003;
+        L0005:;
+        }
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_separator_1, 0, 0);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0003:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        {
+            for (;;) {
+                const size_t p = ctx->cur;
+                MARK_VAR_AS_USED
+                const size_t n = chunk->thunks.n;
+                {
+                    int u;
+                    const size_t n = pcc_get_char_as_utf32(ctx, &u);
+                    if (n == 0) goto L0010;
+                    if (!(
+                        u == 0x000020 ||
+                        u == 0x000009
+                    )) goto L0010;
+                    ctx->cur += n;
+                }
+                if (ctx->cur == p) break;
+                continue;
+            L0010:;
+                ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+                pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+                break;
+            }
+        }
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_line_comment, &(chunk->thunks), NULL)) goto L0009;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0009;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_separator_2, 0, 0);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0009:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        goto L0000;
+    L0001:;
+    }
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "statement_separator", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
+    return chunk;
+L0000:;
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "statement_separator", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_thunk_chunk__destroy(ctx, chunk);
+    return NULL;
+}
+
+static pcc_thunk_chunk_t *pcc_evaluate_rule_statement_with_block(pcc_context_t *ctx) {
+    pcc_thunk_chunk_t *const chunk = pcc_thunk_chunk__create(ctx);
+    chunk->pos = ctx->cur;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "statement_with_block", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
+    ctx->level++;
+    pcc_value_table__resize(ctx->auxil, &(chunk->values), 1);
     pcc_value_table__clear(ctx->auxil, &(chunk->values));
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_if_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_0, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_with_block_0, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_while_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_1, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_with_block_1, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_function_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_2, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_with_block_2, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_flag_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0005;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_3, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_with_block_3, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_return_statement, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_4, 2, 0);
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_with_block_4, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
-        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_break, &(chunk->thunks), NULL)) goto L0007;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0007;
-        {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_5, 2, 0);
-            thunk->data.leaf.capt0.range.start = chunk->pos;
-            thunk->data.leaf.capt0.range.end = ctx->cur;
-            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
-            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
-        }
-        goto L0001;
-    L0007:;
-        ctx->cur = p;
-        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_continue, &(chunk->thunks), NULL)) goto L0008;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0008;
-        {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_6, 2, 0);
-            thunk->data.leaf.capt0.range.start = chunk->pos;
-            thunk->data.leaf.capt0.range.end = ctx->cur;
-            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
-            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
-        }
-        goto L0001;
-    L0008:;
-        ctx->cur = p;
-        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_assignment, &(chunk->thunks), &(chunk->values.p[1]))) goto L0009;
-        {
-            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_7, 2, 0);
-            thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
-            thunk->data.leaf.capt0.range.start = chunk->pos;
-            thunk->data.leaf.capt0.range.end = ctx->cur;
-            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
-            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
-        }
-        goto L0001;
-    L0009:;
-        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
-    PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "statement_with_block", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
-    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "statement_with_block", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_thunk_chunk__destroy(ctx, chunk);
+    return NULL;
+}
+
+static pcc_thunk_chunk_t *pcc_evaluate_rule_statement_simple(pcc_context_t *ctx) {
+    pcc_thunk_chunk_t *const chunk = pcc_thunk_chunk__create(ctx);
+    chunk->pos = ctx->cur;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "statement_simple", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
+    ctx->level++;
+    pcc_value_table__resize(ctx->auxil, &(chunk->values), 1);
+    pcc_value_table__clear(ctx->auxil, &(chunk->values));
+    {
+        const size_t p = ctx->cur;
+        const size_t n = chunk->thunks.n;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_break, &(chunk->thunks), NULL)) goto L0002;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0002;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_simple_0, 1, 0);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0002:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_continue, &(chunk->thunks), NULL)) goto L0003;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0003;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_simple_1, 1, 0);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0003:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_assignment, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_statement_simple_2, 1, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0004:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        goto L0000;
+    L0001:;
+    }
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "statement_simple", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
+    return chunk;
+L0000:;
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "statement_simple", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
     pcc_thunk_chunk__destroy(ctx, chunk);
     return NULL;
 }
@@ -5620,11 +6626,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_block(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -5645,17 +6653,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_block(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "block", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5691,11 +6702,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_if_statement(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_if, &(chunk->thunks), NULL)) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp1, &(chunk->thunks), NULL)) goto L0003;
@@ -5714,11 +6727,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_if_statement(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_if, &(chunk->thunks), NULL)) goto L0004;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp1, &(chunk->thunks), NULL)) goto L0004;
@@ -5732,17 +6747,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_if_statement(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "if_statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5770,10 +6788,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_while_statement(pcc_context_t *ctx) 
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "while_statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5804,10 +6824,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_function_statement(pcc_context_t *ct
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "function_statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -5850,6 +6872,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0003:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
@@ -5890,11 +6913,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0004:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
             if (i < 1) {
                 ctx->cur = p0;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                 goto L0002;
             }
@@ -5922,11 +6947,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0005:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
             if (i < 1) {
                 ctx->cur = p0;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                 goto L0002;
             }
@@ -5951,9 +6978,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                     ) goto L0007;
                     ctx->cur++;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     goto L0006;
                 L0007:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 }
                 {
                     const size_t p = ctx->cur;
@@ -5963,9 +6992,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                     ) goto L0008;
                     ctx->cur++;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     goto L0006;
                 L0008:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 }
                 {
                     int u;
@@ -5977,6 +7008,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0006:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
@@ -5992,6 +7024,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             goto L0009;
         L0010:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -6001,6 +7034,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             goto L0009;
         L0011:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -6010,6 +7044,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             goto L0009;
         L0012:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             {
                 const size_t p = ctx->cur;
@@ -6020,13 +7055,16 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                     ctx->cur += n;
                 }
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 goto L0013;
             L0014:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             }
             goto L0009;
         L0013:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0009:;
@@ -6037,11 +7075,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '/' ||
@@ -6067,6 +7107,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0016:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
@@ -6107,11 +7148,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0017:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
             if (i < 1) {
                 ctx->cur = p0;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                 goto L0015;
             }
@@ -6139,11 +7182,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0018:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
             if (i < 1) {
                 ctx->cur = p0;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
                 goto L0015;
             }
@@ -6169,9 +7214,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                     ) goto L0020;
                     ctx->cur++;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     goto L0019;
                 L0020:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 }
                 {
                     const size_t p = ctx->cur;
@@ -6181,9 +7228,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                     ) goto L0021;
                     ctx->cur++;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     goto L0019;
                 L0021:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 }
                 {
                     int u;
@@ -6195,6 +7244,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                 continue;
             L0019:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 break;
             }
@@ -6210,6 +7260,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             goto L0022;
         L0023:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -6219,6 +7270,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             goto L0022;
         L0024:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -6228,6 +7280,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             goto L0022;
         L0025:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             {
                 const size_t p = ctx->cur;
@@ -6238,13 +7291,16 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
                     ctx->cur += n;
                 }
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 goto L0026;
             L0027:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             }
             goto L0022;
         L0026:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0015;
         L0022:;
@@ -6255,17 +7311,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_flag_statement(pcc_context_t *c
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0015:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dice_flag_statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6300,11 +7359,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_parameter_list(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -6325,17 +7386,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_parameter_list(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "parameter_list", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6370,11 +7434,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier_list(pcc_context_t *ctx) 
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_identifier_node, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
@@ -6383,17 +7449,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier_list(pcc_context_t *ctx) 
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "identifier_list", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6422,11 +7491,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_return_statement(pcc_context_t *ctx)
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword_return, &(chunk->thunks), NULL)) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0003;
@@ -6435,17 +7506,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_return_statement(pcc_context_t *ctx)
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "return_statement", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6479,9 +7553,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_assignment(pcc_context_t *ctx) {
             ) goto L0003;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0002;
         L0003:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_assignment, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
@@ -6492,11 +7568,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_assignment(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ternary, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
@@ -6513,9 +7591,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_assignment(pcc_context_t *ctx) {
             ) goto L0005;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0004;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_assignment, &(chunk->thunks), &(chunk->values.p[1]))) goto L0004;
@@ -6526,11 +7606,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_assignment(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ternary, &(chunk->thunks), &(chunk->values.p[2]))) goto L0006;
         {
@@ -6539,17 +7621,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_assignment(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "assignment", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6593,11 +7678,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ternary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ternary_case, &(chunk->thunks), &(chunk->values.p[3]))) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ternary_cases, &(chunk->thunks), &(chunk->values.p[4]))) goto L0003;
@@ -6608,11 +7695,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ternary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_logic_or, &(chunk->thunks), &(chunk->values.p[5]))) goto L0004;
         {
@@ -6621,17 +7710,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ternary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "ternary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6664,10 +7756,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ternary_case(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "ternary_case", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6701,23 +7795,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ternary_cases(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_ternary_cases_1, 2, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "ternary_cases", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -6747,11 +7845,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_logic_or(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_logic_and, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
         {
@@ -6760,17 +7860,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_logic_or(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "logic_or", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6805,11 +7908,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_logic_and(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_bitwise_or, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
         {
@@ -6818,17 +7923,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_logic_and(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "logic_and", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6847,6 +7955,15 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_or(pcc_context_t *ctx) {
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
+        {
+            int r = 1;
+            pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            ctx->capt0.range.start = chunk->pos;
+            ctx->capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+            pcc_predicate_bitwise_or_0(ctx, chunk, &r);
+            if (!r) goto L0002;
+        }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_bitwise_or, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (
@@ -6862,9 +7979,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_or(pcc_context_t *ctx) {
             ) goto L0003;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0002;
         L0003:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_bitwise_and, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
@@ -6875,11 +7994,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_or(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_bitwise_and, &(chunk->thunks), &(chunk->values.p[2]))) goto L0004;
         {
@@ -6888,17 +8009,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_or(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "bitwise_or", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -6917,6 +8041,15 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_and(pcc_context_t *ctx) {
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
+        {
+            int r = 1;
+            pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            ctx->capt0.range.start = chunk->pos;
+            ctx->capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+            pcc_predicate_bitwise_and_0(ctx, chunk, &r);
+            if (!r) goto L0002;
+        }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_bitwise_and, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (
@@ -6932,9 +8065,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_and(pcc_context_t *ctx) {
             ) goto L0003;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0002;
         L0003:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         {
             const size_t p = ctx->cur;
@@ -6944,9 +8079,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_and(pcc_context_t *ctx) {
             ) goto L0004;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0002;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
@@ -6957,11 +8094,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_and(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[2]))) goto L0005;
         {
@@ -6970,17 +8109,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_bitwise_and(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "bitwise_and", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7015,11 +8157,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
@@ -7037,11 +8181,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
@@ -7059,11 +8205,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[0]))) goto L0005;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0005;
@@ -7081,11 +8229,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
@@ -7102,9 +8252,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             ) goto L0007;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0006;
         L0007:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_additive, &(chunk->thunks), &(chunk->values.p[1]))) goto L0006;
@@ -7115,11 +8267,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_comparison, &(chunk->thunks), &(chunk->values.p[0]))) goto L0008;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0008;
@@ -7136,9 +8290,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             ) goto L0009;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0008;
         L0009:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0008;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_additive, &(chunk->thunks), &(chunk->values.p[1]))) goto L0008;
@@ -7149,11 +8305,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_additive, &(chunk->thunks), &(chunk->values.p[2]))) goto L0010;
         {
@@ -7162,17 +8320,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_comparison(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "comparison", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7204,6 +8365,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             goto L0003;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7214,6 +8376,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             goto L0003;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0003:;
@@ -7227,11 +8390,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_additive, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
@@ -7246,6 +8411,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             goto L0007;
         L0008:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7256,6 +8422,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             goto L0007;
         L0009:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0006;
         L0007:;
@@ -7269,11 +8436,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_multiplicative, &(chunk->thunks), &(chunk->values.p[2]))) goto L0010;
         {
@@ -7282,17 +8451,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_additive(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "additive", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7324,6 +8496,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             goto L0003;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7334,6 +8507,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             goto L0003;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0003:;
@@ -7346,9 +8520,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             ) goto L0006;
             ctx->cur++;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0002;
         L0006:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_null_coalescing, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
@@ -7359,11 +8535,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_multiplicative, &(chunk->thunks), &(chunk->values.p[0]))) goto L0007;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0007;
@@ -7378,6 +8556,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             goto L0008;
         L0009:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7388,6 +8567,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             goto L0008;
         L0010:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0007;
         L0008:;
@@ -7401,11 +8581,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0007:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_multiplicative, &(chunk->thunks), &(chunk->values.p[0]))) goto L0011;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0011;
@@ -7423,11 +8605,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0011:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_null_coalescing, &(chunk->thunks), &(chunk->values.p[2]))) goto L0012;
         {
@@ -7436,17 +8620,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_multiplicative(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0012:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "multiplicative", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7481,11 +8668,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_null_coalescing(pcc_context_t *ctx) 
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_power, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
         {
@@ -7494,17 +8683,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_null_coalescing(pcc_context_t *ctx) 
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "null_coalescing", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7536,6 +8728,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_power(pcc_context_t *ctx) {
             goto L0003;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 ||
@@ -7545,6 +8738,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_power(pcc_context_t *ctx) {
             goto L0003;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0003:;
@@ -7558,11 +8752,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_power(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_unary, &(chunk->thunks), &(chunk->values.p[2]))) goto L0006;
         {
@@ -7571,17 +8767,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_power(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "power", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7611,6 +8810,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             goto L0003;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7621,23 +8821,26 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             goto L0003;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0003:;
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_unary, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_unary_0, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -7650,6 +8853,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             goto L0007;
         L0008:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7660,23 +8864,26 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             goto L0007;
         L0009:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0006;
         L0007:;
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0006;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_unary, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_unary_1, 1, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -7703,11 +8910,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -7722,11 +8931,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0011:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice, &(chunk->thunks), &(chunk->values.p[0]))) goto L0012;
         {
@@ -7735,17 +8946,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_unary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0012:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "unary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7764,35 +8978,23 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice(pcc_context_t *ctx) {
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
-        {
-            int u;
-            const size_t n = pcc_get_char_as_utf32(ctx, &u);
-            if (n == 0) goto L0002;
-            if (!(
-                u == 0x000064 ||
-                u == 0x000044
-            )) goto L0002;
-            ctx->cur += n;
-        }
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_modifiers, &(chunk->thunks), &(chunk->values.p[2]))) goto L0002;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_custom_dice, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_0, 4, 0);
             thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
-            thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
-            thunk->data.leaf.values.p[2] = &(chunk->values.p[2]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice, &(chunk->thunks), &(chunk->values.p[1]))) goto L0003;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
         {
             int u;
             const size_t n = pcc_get_char_as_utf32(ctx, &u);
@@ -7803,68 +9005,243 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice(pcc_context_t *ctx) {
             )) goto L0003;
             ctx->cur += n;
         }
-        {
-            const size_t p = ctx->cur;
-            if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
-            if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_operand_start, &(chunk->thunks), NULL)) goto L0004;
-            ctx->cur = p;
-            goto L0005;
-        L0004:;
-            ctx->cur = p;
-            goto L0003;
-        L0005:;
-        }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix, &(chunk->thunks), &(chunk->values.p[1]))) goto L0003;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_modifiers, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix, &(chunk->thunks), &(chunk->values.p[2]))) goto L0003;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_modifiers, &(chunk->thunks), &(chunk->values.p[3]))) goto L0003;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_1, 4, 0);
             thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
             thunk->data.leaf.values.p[2] = &(chunk->values.p[2]);
+            thunk->data.leaf.values.p[3] = &(chunk->values.p[3]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice, &(chunk->thunks), &(chunk->values.p[3]))) goto L0006;
+        {
+            int u;
+            const size_t n = pcc_get_char_as_utf32(ctx, &u);
+            if (n == 0) goto L0004;
+            if (!(
+                u == 0x000064 ||
+                u == 0x000044
+            )) goto L0004;
+            ctx->cur += n;
+        }
+        {
+            const size_t p = ctx->cur;
+            if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0005;
+            if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_operand_start, &(chunk->thunks), NULL)) goto L0005;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            goto L0006;
+        L0005:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            goto L0004;
+        L0006:;
+        }
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0004;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix, &(chunk->thunks), &(chunk->values.p[2]))) goto L0004;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_modifiers, &(chunk->thunks), &(chunk->values.p[3]))) goto L0004;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_2, 4, 0);
+            thunk->data.leaf.values.p[2] = &(chunk->values.p[2]);
             thunk->data.leaf.values.p[3] = &(chunk->values.p[3]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
-    L0006:;
+    L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix, &(chunk->thunks), &(chunk->values.p[3]))) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix_no_special, &(chunk->thunks), &(chunk->values.p[1]))) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0007;
+        {
+            int u;
+            const size_t n = pcc_get_char_as_utf32(ctx, &u);
+            if (n == 0) goto L0007;
+            if (!(
+                u == 0x000064 ||
+                u == 0x000044
+            )) goto L0007;
+            ctx->cur += n;
+        }
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_modifiers, &(chunk->thunks), &(chunk->values.p[3]))) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0007;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_3, 4, 0);
+            thunk->data.leaf.values.p[1] = &(chunk->values.p[1]);
             thunk->data.leaf.values.p[3] = &(chunk->values.p[3]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0007:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        {
+            int u;
+            const size_t n = pcc_get_char_as_utf32(ctx, &u);
+            if (n == 0) goto L0008;
+            if (!(
+                u == 0x000064 ||
+                u == 0x000044
+            )) goto L0008;
+            ctx->cur += n;
+        }
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0008;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dice_modifiers, &(chunk->thunks), &(chunk->values.p[3]))) goto L0008;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0008;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_4, 4, 0);
+            thunk->data.leaf.values.p[3] = &(chunk->values.p[3]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0008:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice, &(chunk->thunks), &(chunk->values.p[0]))) goto L0009;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_5, 4, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0009:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix, &(chunk->thunks), &(chunk->values.p[0]))) goto L0010;
+        {
+            pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_6, 4, 0);
+            thunk->data.leaf.values.p[0] = &(chunk->values.p[0]);
+            thunk->data.leaf.capt0.range.start = chunk->pos;
+            thunk->data.leaf.capt0.range.end = ctx->cur;
+            pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+            pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+        }
+        goto L0001;
+    L0010:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_thunk_chunk__destroy(ctx, chunk);
+    return NULL;
+}
+
+static pcc_thunk_chunk_t *pcc_evaluate_rule_custom_dice(pcc_context_t *ctx) {
+    pcc_thunk_chunk_t *const chunk = pcc_thunk_chunk__create(ctx);
+    chunk->pos = ctx->cur;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "custom_dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
+    ctx->level++;
+    {
+        int r = 1;
+        pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        ctx->capt0.range.start = chunk->pos;
+        ctx->capt0.range.end = ctx->cur;
+        pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+        pcc_predicate_custom_dice_0(ctx, chunk, &r);
+        if (!r) goto L0000;
+    }
+    {
+        const size_t p0 = ctx->cur;
+        const size_t n0 = chunk->thunks.n;
+        int i;
+        for (i = 0;; i++) {
+            const size_t p = ctx->cur;
+            MARK_VAR_AS_USED
+            const size_t n = chunk->thunks.n;
+            {
+                int r = 1;
+                pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+                ctx->capt0.range.start = chunk->pos;
+                ctx->capt0.range.end = ctx->cur;
+                pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+                pcc_predicate_custom_dice_1(ctx, chunk, &r);
+                if (!r) goto L0001;
+            }
+            {
+                int u;
+                const size_t n = pcc_get_char_as_utf32(ctx, &u);
+                if (n == 0) goto L0001;
+                ctx->cur += n;
+            }
+            if (ctx->cur == p) break;
+            continue;
+        L0001:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            break;
+        }
+        if (i < 1) {
+            ctx->cur = p0;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
+            goto L0000;
+        }
+    }
+    {
+        int r = 1;
+        pcc_marker_variable_set_record__save(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        ctx->capt0.range.start = chunk->pos;
+        ctx->capt0.range.end = ctx->cur;
+        pcc_char_array__resize(ctx->auxil, &(ctx->capt0.string), 0);
+        pcc_predicate_custom_dice_2(ctx, chunk, &r);
+        if (!r) goto L0000;
+    }
+    {
+        pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_custom_dice_0, 0, 0);
+        thunk->data.leaf.capt0.range.start = chunk->pos;
+        thunk->data.leaf.capt0.range.end = ctx->cur;
+        pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
+        pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
+    }
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "custom_dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
+    return chunk;
+L0000:;
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "custom_dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
     pcc_thunk_chunk__destroy(ctx, chunk);
     return NULL;
 }
@@ -7893,6 +9270,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_operand_start(pcc_context_t *ct
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7903,6 +9281,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_operand_start(pcc_context_t *ct
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xef' ||
@@ -7913,12 +9292,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_operand_start(pcc_context_t *ct
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dice_operand_start", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -7946,23 +9327,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifiers(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dice_modifiers_1, 2, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dice_modifiers", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -7987,6 +9372,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0003;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             {
                 int u;
@@ -8001,6 +9387,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0003;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0002;
         L0003:;
@@ -8013,11 +9400,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -8030,6 +9419,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0007;
         L0008:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             {
                 int u;
@@ -8044,6 +9434,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0007;
         L0009:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0006;
         L0007:;
@@ -8056,11 +9447,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'd' ||
@@ -8075,11 +9468,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'd' ||
@@ -8094,11 +9489,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0011:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -8111,6 +9508,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0013;
         L0014:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             {
                 int u;
@@ -8125,6 +9523,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0013;
         L0015:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0012;
         L0013:;
@@ -8134,11 +9533,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0012:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -8151,6 +9552,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0017;
         L0018:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             {
                 int u;
@@ -8165,6 +9567,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0017;
         L0019:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0016;
         L0017:;
@@ -8174,11 +9577,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0016:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'd' ||
@@ -8190,11 +9595,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0020:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'd' ||
@@ -8206,11 +9613,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0021:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'm' ||
@@ -8226,11 +9635,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0022:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'm' ||
@@ -8246,11 +9657,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0023:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -8267,6 +9680,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0025;
         L0026:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xe5' ||
@@ -8280,6 +9694,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0025;
         L0027:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0024;
         L0025:;
@@ -8289,11 +9704,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0024:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -8310,6 +9727,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0029;
         L0030:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             if (
                 pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != '\xe5' ||
@@ -8323,6 +9741,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             goto L0029;
         L0031:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             goto L0028;
         L0029:;
@@ -8332,17 +9751,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dice_modifier(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0028:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dice_modifier", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8365,10 +9787,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_modifier_value(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "modifier_value", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8410,11 +9834,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_postfix_no_special, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
@@ -8439,11 +9865,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8456,18 +9884,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             ctx->cur += n;
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_number, &(chunk->thunks), &(chunk->values.p[4]))) goto L0004;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0004;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0004;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_special_dice_2, 5, 0);
             thunk->data.leaf.values.p[4] = &(chunk->values.p[4]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8480,18 +9910,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             ctx->cur += n;
         }
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_number, &(chunk->thunks), &(chunk->values.p[4]))) goto L0005;
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0005;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0005;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_special_dice_3, 5, 0);
             thunk->data.leaf.values.p[4] = &(chunk->values.p[4]);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8503,17 +9935,19 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             )) goto L0006;
             ctx->cur += n;
         }
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0006;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0006;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_special_dice_4, 5, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8525,17 +9959,19 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             )) goto L0007;
             ctx->cur += n;
         }
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0007;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0007;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_special_dice_5, 5, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0007:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8547,27 +9983,92 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice(pcc_context_t *ctx) {
             )) goto L0008;
             ctx->cur += n;
         }
-        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0008;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_special_dice_boundary, &(chunk->thunks), NULL)) goto L0008;
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_special_dice_6, 5, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "special_dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "special_dice", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_thunk_chunk__destroy(ctx, chunk);
+    return NULL;
+}
+
+static pcc_thunk_chunk_t *pcc_evaluate_rule_special_dice_boundary(pcc_context_t *ctx) {
+    pcc_thunk_chunk_t *const chunk = pcc_thunk_chunk__create(ctx);
+    chunk->pos = ctx->cur;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_EVALUATE, "special_dice_boundary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->buffer.n - chunk->pos);
+    ctx->level++;
+    if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
+    {
+        const size_t p = ctx->cur;
+        {
+            const size_t p = ctx->cur;
+            const size_t n = chunk->thunks.n;
+            if (
+                pcc_refill_buffer(ctx, 1) < 1 ||
+                ctx->buffer.p[ctx->cur] != '['
+            ) goto L0003;
+            ctx->cur++;
+            goto L0002;
+        L0003:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            if (
+                pcc_refill_buffer(ctx, 1) < 1 ||
+                ctx->buffer.p[ctx->cur] != '.'
+            ) goto L0004;
+            ctx->cur++;
+            goto L0002;
+        L0004:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            if (
+                pcc_refill_buffer(ctx, 1) < 1 ||
+                ctx->buffer.p[ctx->cur] != '('
+            ) goto L0005;
+            ctx->cur++;
+            goto L0002;
+        L0005:;
+            ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+            pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
+            goto L0001;
+        L0002:;
+        }
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+        goto L0000;
+    L0001:;
+        ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
+    }
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "special_dice_boundary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
+    return chunk;
+L0000:;
+    ctx->level--;
+    PCC_DEBUG(ctx->auxil, PCC_DBG_NOMATCH, "special_dice_boundary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
     pcc_thunk_chunk__destroy(ctx, chunk);
     return NULL;
 }
@@ -8591,23 +10092,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_wod_options(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_wod_options_1, 2, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "wod_options", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -8639,11 +10144,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_wod_option(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8663,11 +10170,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_wod_option(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -8687,17 +10196,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_wod_option(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "wod_option", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8725,23 +10237,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dc_options(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_dc_options_1, 2, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dc_options", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -8770,10 +10286,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dc_option(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dc_option", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8798,10 +10316,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_postfix(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "postfix", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8826,10 +10346,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_postfix_no_special(pcc_context_t *ct
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "postfix_no_special", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8854,10 +10376,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_raw_primary(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "raw_primary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8883,11 +10407,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_raw_base(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_this_node, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
@@ -8896,17 +10422,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_raw_base(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "raw_base", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -8925,6 +10454,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffixes(pcc_context_t *ctx) {
     {
         const size_t p = ctx->cur;
         const size_t n = chunk->thunks.n;
+        if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_suffix, &(chunk->thunks), &(chunk->values.p[0]))) goto L0002;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_suffixes, &(chunk->thunks), &(chunk->values.p[1]))) goto L0002;
         {
@@ -8934,23 +10464,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffixes(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_suffixes_1, 2, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "suffixes", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -8971,11 +10505,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -8996,11 +10532,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9015,11 +10553,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9037,11 +10577,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9062,11 +10604,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'k' ||
@@ -9080,11 +10624,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0007:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'k' ||
@@ -9097,11 +10643,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'k' ||
@@ -9115,11 +10663,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0009:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'k' ||
@@ -9132,17 +10682,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "suffix", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9198,11 +10751,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_slice_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9232,17 +10787,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_slice_suffix(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "slice_suffix", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9268,23 +10826,27 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_maybe_expression(pcc_context_t *ctx)
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             pcc_thunk_t *const thunk = pcc_thunk__create_leaf(ctx, pcc_action_maybe_expression_1, 1, 0);
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "maybe_expression", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -9314,11 +10876,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_argument_list(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_assignment, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
@@ -9327,17 +10891,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_argument_list(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "argument_list", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9363,11 +10930,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_true_node, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
@@ -9376,11 +10945,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_false_node, &(chunk->thunks), &(chunk->values.p[0]))) goto L0004;
         {
@@ -9389,11 +10960,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_number, &(chunk->thunks), &(chunk->values.p[0]))) goto L0005;
         {
@@ -9402,11 +10975,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_string_literal, &(chunk->thunks), &(chunk->values.p[0]))) goto L0006;
         {
@@ -9415,11 +10990,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_template_literal, &(chunk->thunks), &(chunk->values.p[0]))) goto L0007;
         {
@@ -9428,11 +11005,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0007:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_this_node, &(chunk->thunks), &(chunk->values.p[0]))) goto L0008;
         {
@@ -9441,11 +11020,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_identifier_node, &(chunk->thunks), &(chunk->values.p[0]))) goto L0009;
         {
@@ -9454,11 +11035,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0009:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_array_literal, &(chunk->thunks), &(chunk->values.p[0]))) goto L0010;
         {
@@ -9467,11 +11050,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dict_literal, &(chunk->thunks), &(chunk->values.p[0]))) goto L0011;
         {
@@ -9480,11 +11065,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0011:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9505,17 +11092,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_primary(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0012:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "primary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9542,10 +11132,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_null_node(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "null_node", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9572,10 +11164,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_true_node(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "true_node", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9603,10 +11197,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_false_node(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "false_node", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9633,10 +11229,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_this_node(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "this_node", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9671,11 +11269,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_array_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9705,11 +11305,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_array_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9732,6 +11334,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_array_literal(pcc_context_t *ctx) {
             goto L0006;
         L0005:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         L0006:;
         }
@@ -9746,17 +11349,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_array_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "array_literal", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9791,11 +11397,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 ||
@@ -9818,6 +11426,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_literal(pcc_context_t *ctx) {
             goto L0005;
         L0004:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         L0005:;
         }
@@ -9832,17 +11441,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dict_literal", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9877,11 +11489,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_pairs(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_dict_pair, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
@@ -9890,17 +11504,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_pairs(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dict_pairs", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9935,11 +11552,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_pair(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_assignment, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_sp, &(chunk->thunks), NULL)) goto L0003;
@@ -9957,17 +11576,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_dict_pair(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "dict_pair", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -9993,11 +11615,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_number(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_integer_number, &(chunk->thunks), &(chunk->values.p[0]))) goto L0003;
         {
@@ -10006,17 +11630,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_number(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "number", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10048,6 +11675,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_float_number(pcc_context_t *ctx) {
             continue;
         L0001:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
@@ -10078,11 +11706,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_float_number(pcc_context_t *ctx) {
             continue;
         L0002:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
         if (i < 1) {
             ctx->cur = p0;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
             goto L0000;
         }
@@ -10092,10 +11722,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_float_number(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "float_number", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10130,11 +11762,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_integer_number(pcc_context_t *ctx) {
             continue;
         L0001:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
         if (i < 1) {
             ctx->cur = p0;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
             goto L0000;
         }
@@ -10144,10 +11778,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_integer_number(pcc_context_t *ctx) {
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "integer_number", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10185,6 +11821,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                         goto L0004;
                     L0005:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         {
                             const size_t p = ctx->cur;
@@ -10199,9 +11836,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                                 ctx->cur += n;
                             }
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                             goto L0006;
                         L0007:;
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         }
                         {
                             int u;
@@ -10212,6 +11851,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                         goto L0004;
                     L0006:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         goto L0003;
                     L0004:;
@@ -10220,6 +11860,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                     continue;
                 L0003:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                     break;
                 }
@@ -10240,11 +11881,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -10266,6 +11909,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                         goto L0010;
                     L0011:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         {
                             const size_t p = ctx->cur;
@@ -10280,9 +11924,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                                 ctx->cur += n;
                             }
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                             goto L0012;
                         L0013:;
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         }
                         {
                             int u;
@@ -10293,6 +11939,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                         goto L0010;
                     L0012:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         goto L0009;
                     L0010:;
@@ -10301,6 +11948,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
                     continue;
                 L0009:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                     break;
                 }
@@ -10321,17 +11969,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_string_literal(pcc_context_t *ctx) {
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "string_literal", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10369,6 +12020,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                         goto L0004;
                     L0005:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         {
                             const size_t p = ctx->cur;
@@ -10383,9 +12035,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                                 ctx->cur += n;
                             }
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                             goto L0006;
                         L0007:;
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         }
                         {
                             int u;
@@ -10396,6 +12050,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                         goto L0004;
                     L0006:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         goto L0003;
                     L0004:;
@@ -10404,6 +12059,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                     continue;
                 L0003:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                     break;
                 }
@@ -10424,11 +12080,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -10450,6 +12108,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                         goto L0010;
                     L0011:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         {
                             const size_t p = ctx->cur;
@@ -10464,9 +12123,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                                 ctx->cur += n;
                             }
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                             goto L0012;
                         L0013:;
                             ctx->cur = p;
+                            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         }
                         {
                             int u;
@@ -10477,6 +12138,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                         goto L0010;
                     L0012:;
                         ctx->cur = p;
+                        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                         goto L0009;
                     L0010:;
@@ -10485,6 +12147,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
                     continue;
                 L0009:;
                     ctx->cur = p;
+                    pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                     pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                     break;
                 }
@@ -10505,17 +12168,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_template_literal(pcc_context_t *ctx)
             thunk->data.leaf.capt0.range.start = chunk->pos;
             thunk->data.leaf.capt0.range.end = ctx->cur;
             pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+            pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
             pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
         }
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "template_literal", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10542,6 +12208,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_escape(pcc_context_t *ctx) {
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "escape", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10561,10 +12228,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier_node(pcc_context_t *ctx) 
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "identifier_node", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10584,10 +12253,12 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier_no_colon_node(pcc_context
         thunk->data.leaf.capt0.range.start = chunk->pos;
         thunk->data.leaf.capt0.range.end = ctx->cur;
         pcc_char_array__resize(ctx->auxil, &(thunk->data.leaf.capt0.string), 0);
+        pcc_marker_value_set__copy_from(ctx->auxil, &(thunk->data.leaf.mvars), &(ctx->mvars.curr.set));
         pcc_thunk_array__add(ctx, &(chunk->thunks), thunk);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "identifier_no_colon_node", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10605,9 +12276,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier(pcc_context_t *ctx) {
         const size_t p = ctx->cur;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword, &(chunk->thunks), NULL)) goto L0001;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         goto L0000;
     L0001:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
     }
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ident_start, &(chunk->thunks), NULL)) goto L0000;
     {
@@ -10620,12 +12293,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier(pcc_context_t *ctx) {
             continue;
         L0002:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "identifier", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10643,9 +12318,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier_no_colon(pcc_context_t *c
         const size_t p = ctx->cur;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_keyword, &(chunk->thunks), NULL)) goto L0001;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         goto L0000;
     L0001:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
     }
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ident_start, &(chunk->thunks), NULL)) goto L0000;
     {
@@ -10658,12 +12335,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_identifier_no_colon(pcc_context_t *c
             continue;
         L0002:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "identifier_no_colon", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10691,6 +12370,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'i' ||
@@ -10700,6 +12380,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'e' ||
@@ -10711,6 +12392,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0004:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'c' ||
@@ -10726,6 +12408,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'b' ||
@@ -10738,6 +12421,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'r' ||
@@ -10751,6 +12435,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0007:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'f' ||
@@ -10762,6 +12447,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0008:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 't' ||
@@ -10773,6 +12459,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0009:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'f' ||
@@ -10785,6 +12472,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0010:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 'n' ||
@@ -10796,6 +12484,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0011:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         if (
             pcc_refill_buffer(ctx, 1) < 1 || (ctx->buffer.p + ctx->cur)[0] != 't' ||
@@ -10807,6 +12496,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
         goto L0001;
     L0012:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
@@ -10814,6 +12504,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10835,6 +12526,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_if(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_if", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10858,6 +12550,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_else(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_else", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10882,6 +12575,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_while(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_while", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10905,6 +12599,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_func(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_func", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10930,6 +12625,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_return(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_return", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10954,6 +12650,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_break(pcc_context_t *ctx) {
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_break", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10981,6 +12678,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_keyword_continue(pcc_context_t *ctx)
     if (!pcc_apply_rule(ctx, pcc_evaluate_rule_boundary, &(chunk->thunks), NULL)) goto L0000;
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "keyword_continue", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -10998,12 +12696,15 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_boundary(pcc_context_t *ctx) {
         const size_t p = ctx->cur;
         if (!pcc_apply_rule(ctx, pcc_evaluate_rule_ident_continue, &(chunk->thunks), NULL)) goto L0001;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         goto L0000;
     L0001:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "boundary", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -11035,6 +12736,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ident_start(pcc_context_t *ctx) {
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -11048,12 +12750,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ident_start(pcc_context_t *ctx) {
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "ident_start", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -11087,6 +12791,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ident_continue(pcc_context_t *ctx) {
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -11100,12 +12805,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ident_continue(pcc_context_t *ctx) {
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "ident_continue", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -11138,6 +12845,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ident_continue_no_colon(pcc_context_
         goto L0001;
     L0002:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             int u;
@@ -11151,12 +12859,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_ident_continue_no_colon(pcc_context_
         goto L0001;
     L0003:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0001:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "ident_continue_no_colon", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -11193,11 +12903,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_sp(pcc_context_t *ctx) {
                 goto L0002;
             L0003:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 if (!pcc_apply_rule(ctx, pcc_evaluate_rule_line_comment, &(chunk->thunks), NULL)) goto L0004;
                 goto L0002;
             L0004:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 goto L0001;
             L0002:;
@@ -11206,12 +12918,14 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_sp(pcc_context_t *ctx) {
             continue;
         L0001:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "sp", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 }
 
@@ -11246,11 +12960,13 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_sp1(pcc_context_t *ctx) {
                 goto L0002;
             L0003:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 if (!pcc_apply_rule(ctx, pcc_evaluate_rule_line_comment, &(chunk->thunks), NULL)) goto L0004;
                 goto L0002;
             L0004:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
                 goto L0001;
             L0002:;
@@ -11259,17 +12975,20 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_sp1(pcc_context_t *ctx) {
             continue;
         L0001:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
         if (i < 1) {
             ctx->cur = p0;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n0);
             goto L0000;
         }
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "sp1", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
@@ -11306,9 +13025,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_line_comment(pcc_context_t *ctx) {
         ) goto L0001;
         ctx->cur += 11;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         goto L0000;
     L0001:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
     }
     {
         for (;;) {
@@ -11323,9 +13044,11 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_line_comment(pcc_context_t *ctx) {
                 ) goto L0003;
                 ctx->cur++;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
                 goto L0002;
             L0003:;
                 ctx->cur = p;
+                pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             }
             {
                 int u;
@@ -11337,6 +13060,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_line_comment(pcc_context_t *ctx) {
             continue;
         L0002:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
             break;
         }
@@ -11352,6 +13076,7 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_line_comment(pcc_context_t *ctx) {
         goto L0004;
     L0005:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         {
             const size_t p = ctx->cur;
@@ -11362,19 +13087,23 @@ static pcc_thunk_chunk_t *pcc_evaluate_rule_line_comment(pcc_context_t *ctx) {
                 ctx->cur += n;
             }
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
             goto L0006;
         L0007:;
             ctx->cur = p;
+            pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         }
         goto L0004;
     L0006:;
         ctx->cur = p;
+        pcc_marker_variable_set_record__restore(ctx->auxil, &(ctx->mvars), ctx->pos + ctx->cur);
         pcc_thunk_array__revert(ctx, &(chunk->thunks), n);
         goto L0000;
     L0004:;
     }
     ctx->level--;
     PCC_DEBUG(ctx->auxil, PCC_DBG_MATCH, "line_comment", ctx->level, chunk->pos, ctx->buffer.p + chunk->pos, ctx->cur - chunk->pos);
+    pcc_marker_variable_set_entry__copy(ctx->auxil, &(chunk->mvars), &(ctx->mvars.curr));
     return chunk;
 L0000:;
     ctx->level--;
